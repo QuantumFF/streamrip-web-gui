@@ -71,14 +71,15 @@ class DownloadWorker(threading.Thread):
                 cmd.extend(['-f', DOWNLOAD_DIR])
                 cmd.extend(['-q', str(quality)])
                 cmd.extend(['url', url])
-                
+
                 process = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
+                    encoding='utf-8',
+                    errors='replace',
                     bufsize=1,
-                    universal_newlines=True
                 )
                 
                 self.current_process = process
@@ -284,7 +285,7 @@ def search_music():
         
         logger.info(f"Executing command: {' '.join(cmd)}")
         
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=30)
         
         logger.info(f"Command completed with return code: {result.returncode}")
         
@@ -334,6 +335,7 @@ def search_music():
         try:
             with open(tmp_path, 'r') as f:
                 content = f.read()
+                logger.info(f"Streamrip search output: {content[:500]}")
                 logger.info(f"File content length: {len(content)} characters")
                 logger.debug(f"File content (first 500 chars):\n{content[:500]}")
                 
@@ -474,19 +476,24 @@ def get_album_art():
             match = re.search(r'soundcloud:tracks:(\d+)', item_id)
             if match:
                 item_id = match.group(1)
-    
+
     cache_key = f"{source}_{media_type}_{item_id}"
     if cache_key in album_art_cache:
-        return jsonify({'album_art': album_art_cache[cache_key]})
-    
+        cached = album_art_cache[cache_key]
+        if isinstance(cached, dict):
+            return jsonify(cached)
+        return jsonify({'album_art': cached})
+
     try:
         if source == 'qobuz':
-            app_id = get_qobuz_app_id()
-            album_art = fetch_single_album_art(item_id, media_type, app_id)
-            if album_art:
-                album_art_cache[cache_key] = album_art
-                return jsonify({'album_art': album_art})
-            return jsonify({'album_art': ''})
+            result = fetch_single_album_art(item_id, media_type, None) 
+            album_art_cache[cache_key] = result
+            return jsonify({
+                'album_art': result.get('album_art', ''),
+                'tracks_count': result.get('tracks_count'),
+                'release_type': result.get('release_type'),
+                'year': result.get('year'),
+            })
         
         elif source == 'tidal':
             if media_type == 'artist':
@@ -552,76 +559,60 @@ def browse_downloads():
         return jsonify({'error': str(e)}), 500
 
 
-def fetch_single_album_art(item_id, media_type, app_id):
-    """Fetch album art for a single Qobuz item"""
+def get_qobuz_credentials():
     try:
-        api_base = "https://www.qobuz.com/api.json/0.2"
-        endpoints = {
-            'album': f"{api_base}/album/get",
-            'track': f"{api_base}/track/get", 
-            'artist': f"{api_base}/artist/get"
-        }
-        
-        if media_type not in endpoints:
-            return None
-            
-        params = {'app_id': app_id}
-        if media_type == 'album':
-            params['album_id'] = item_id
-        elif media_type == 'track':
-            params['track_id'] = item_id
-        elif media_type == 'artist':
-            params['artist_id'] = item_id
-            
-        response = requests.get(endpoints[media_type], params=params, timeout=3)
-        if response.status_code != 200:
-            return None
-            
-        data = response.json()
-        
-        #Check if we got a minimal response (no actual data)
-        if len(data) <= 2:  
-            logger.debug(f"Minimal data for {media_type} {item_id}: {data}")
-            return None
-        
-        image_data = None
-        
-        if media_type == 'album' and 'image' in data:
-            image_data = data['image']
-        elif media_type == 'track' and 'album' in data and 'image' in data['album']:
-            image_data = data['album']['image']
-        elif media_type == 'artist':
-            
-            for field in ['image', 'picture', 'photo', 'images', 'thumbnail', 'avatar']:
-                if field in data:
-                    image_data = data[field]
-                    break
-            
-            if not image_data:
-                logger.debug(f"No image field found for artist {item_id}")
-                return None
-        
-        if not image_data:
-            return None
-            
-        if isinstance(image_data, dict):
-            for size in ['extralarge', 'large', 'medium', 'small', 'thumbnail']:
-                if size in image_data and image_data[size]:
-                    url = image_data[size]
-                    if url and isinstance(url, str) and url.startswith('http'):
-                        return url
-        elif isinstance(image_data, str) and image_data.startswith('http'):
-            return image_data
-        elif isinstance(image_data, list) and len(image_data) > 0:
-            for item in image_data:
-                if isinstance(item, str) and item.startswith('http'):
-                    return item
-                    
-        return None
-        
+        if os.path.exists(STREAMRIP_CONFIG):
+            with open(STREAMRIP_CONFIG, 'r') as f:
+                config_content = f.read()
+
+            app_id = re.search(r'app_id\s*=\s*["\']?([^"\'\n]+)["\']?', config_content)
+            token = re.search(r'password_or_token\s*=\s*"([^"]+)"', config_content)
+
+            return {
+                'app_id': app_id.group(1).strip() if app_id else '950096963',
+                'token': token.group(1).strip() if token else None
+            }
     except Exception as e:
-        logger.error(f"Error fetching album art for {media_type} {item_id}: {e}")
-        return None
+        logger.error(f"Error reading Qobuz credentials: {e}")
+    return {'app_id': '950096963', 'token': None}
+
+
+def fetch_single_album_art(item_id, media_type, app_id):
+    creds = get_qobuz_credentials()
+    if not creds['token']:
+        return {}
+
+    try:
+        response = requests.get(
+            f"https://www.qobuz.com/api.json/0.2/{media_type}/get",
+            params={
+                'app_id': creds['app_id'],
+                f'{media_type}_id': item_id,
+            },
+            headers={
+                'X-App-Id': creds['app_id'],
+                'X-User-Auth-Token': creds['token'],
+            },
+            timeout=3
+        )
+        if response.status_code == 200:
+            data = response.json()
+            image = data.get('image', {})
+
+            year = None
+            release_date = data.get('release_date_original', '')
+            if release_date:
+                year = release_date[:4]
+
+            return {
+                'album_art': image.get('large') or image.get('small') or image.get('thumbnail') or '',
+                'tracks_count': data.get('tracks_count'),
+                'release_type': data.get('release_type'),
+                'year': year,
+            }
+    except Exception as e:
+        logger.error(f"Error fetching Qobuz album art: {e}")
+    return {}
 
 def get_qobuz_app_id():
     try:
