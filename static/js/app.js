@@ -543,40 +543,64 @@ async function loadAlbumArtForVisibleItems() {
             const response = await fetch(`/api/album-art?source=${source}&type=${type}&id=${encodeURIComponent(itemId)}`);
             const data = await response.json();
             if (data.album_art) {
-    const artElement = document.getElementById(`art-${itemId}`);
-    if (artElement) {
-        artElement.classList.remove('placeholder');
-        artElement.innerHTML = `<img src="${data.album_art}" alt="Album art" class="result-album-art" onerror="this.parentElement.classList.add('placeholder'); this.parentElement.innerHTML='▶'">`;
-    }
-} else {
-    const artElement = document.getElementById(`art-${itemId}`);
-    if (artElement && artElement.classList.contains('placeholder')) {
-        artElement.classList.add('loaded');
-        if (type === 'artist') {
-            artElement.innerHTML = '👤';
-        } else if (type === 'track') {
-            artElement.innerHTML = '🎵';
-        } else {
-            artElement.innerHTML = '▶';
-        }
-    }
-}
+                const artElement = document.getElementById(`art-${itemId}`);
+                if (artElement) {
+                    artElement.classList.remove('placeholder');
+                    artElement.innerHTML = `<img src="${data.album_art}" alt="Album art" class="result-album-art" onerror="this.parentElement.classList.add('placeholder'); this.parentElement.innerHTML='▶'">`;
+                }
+            } else {
+                const artElement = document.getElementById(`art-${itemId}`);
+                if (artElement && artElement.classList.contains('placeholder')) {
+                    artElement.classList.add('loaded');
+                    if (type === 'artist') {
+                        artElement.innerHTML = '👤';
+                    } else if (type === 'track') {
+                        artElement.innerHTML = '🎵';
+                    } else {
+                        artElement.innerHTML = '▶';
+                    }
+                }
+            }
+
+            if (data.release_type || data.tracks_count || data.year) {
+                const infoEl = item.querySelector('.result-info');
+                if (infoEl) {
+                    const existing = infoEl.querySelector('.result-extra-meta');
+                    if (existing) existing.remove();
+
+                    const parts = [];
+                    if (data.release_type) parts.push(data.release_type.toUpperCase());
+                    if (data.year) parts.push(data.year);
+                    if (data.tracks_count) parts.push(`${data.tracks_count} tracks`);
+
+
+                    const meta = document.createElement('div');
+                    meta.className = 'result-extra-meta';
+                    meta.textContent = parts.join(' · ');
+                    const resultId = infoEl.querySelector('.result-id');
+                    if (resultId) {
+                        infoEl.insertBefore(meta, resultId);
+                    } else {
+                        infoEl.appendChild(meta); // fallback if no result-id exists
+                    }
+                }
+            }
+
         } catch (error) {
             console.error('Error loading album art:', error);
             const artElement = document.getElementById(`art-${itemId}`);
             if (artElement && artElement.classList.contains('placeholder')) {
                 if (type === 'artist') {
-                    artElement.innerHTML = '👤'; 
+                    artElement.innerHTML = '👤';
                 } else if (type === 'track') {
-                    artElement.innerHTML = '🎵'; 
+                    artElement.innerHTML = '🎵';
                 } else {
-                    artElement.innerHTML = '▶'; 
+                    artElement.innerHTML = '▶';
                 }
             }
         }
     }
 }
-
 async function downloadFromUrl(url) {
     const quality = document.getElementById('qualitySelect').value;
     
