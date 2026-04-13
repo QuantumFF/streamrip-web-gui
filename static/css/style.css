@@ -597,6 +597,13 @@ button:disabled {
     flex-shrink: 0;
 }
 
+.result-extra-meta
+{
+    font-size: 11px;
+    color: var(--text-primary);
+    margin-top: 4px;
+    font-family: 'IBM Plex Mono', monospace;
+}
 /* Scrollbar Styling */
 ::-webkit-scrollbar {
     width: 8px;
