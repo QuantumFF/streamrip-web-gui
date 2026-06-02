@@ -20,9 +20,21 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-STREAMRIP_CONFIG = os.environ.get('STREAMRIP_CONFIG', '/config/config.toml') 
-DOWNLOAD_DIR = os.environ.get('DOWNLOAD_DIR', '/music') 
-MAX_CONCURRENT_DOWNLOADS = int(os.environ.get('MAX_CONCURRENT_DOWNLOADS', '2')) 
+#Defaults work for a local run; Docker overrides these via docker-compose environment
+STREAMRIP_CONFIG = os.environ.get('STREAMRIP_CONFIG', os.path.expanduser('~/.config/streamrip/config.toml'))
+DOWNLOAD_DIR = os.environ.get('DOWNLOAD_DIR', os.path.expanduser('~/Music'))
+MAX_CONCURRENT_DOWNLOADS = int(os.environ.get('MAX_CONCURRENT_DOWNLOADS', '2'))
+
+#Fail loudly at startup if the download dir is unusable, instead of silently per-download
+try:
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    if not os.access(DOWNLOAD_DIR, os.W_OK):
+        raise PermissionError(f"directory is not writable")
+except OSError as e:
+    logger.error("=" * 60)
+    logger.error(f"DOWNLOAD_DIR '{DOWNLOAD_DIR}' is not usable: {e}")
+    logger.error("All downloads WILL FAIL. Set the DOWNLOAD_DIR environment variable to a writable directory.")
+    logger.error("=" * 60)
 
 download_queue = queue.Queue()
 active_downloads = {}
@@ -97,7 +109,11 @@ class DownloadWorker(threading.Thread):
                             })
                 
                 process.wait()
-                
+
+                if process.returncode != 0:
+                    logger.error(f"Download failed (exit code {process.returncode}): {' '.join(cmd)}")
+                    logger.error("rip output (last 30 lines):\n%s", "\n".join(output_lines[-30:]))
+
                 broadcast_sse({
                     'type': 'download_completed',
                     'id': task_id,
@@ -108,6 +124,7 @@ class DownloadWorker(threading.Thread):
                 })
                             
             except Exception as e:
+                logger.exception(f"Download worker error for {url}")
                 broadcast_sse({
                     'type': 'download_error',
                     'id': task_id,
