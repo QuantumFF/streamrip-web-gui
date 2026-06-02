@@ -199,6 +199,11 @@ for _ in range(MAX_CONCURRENT_DOWNLOADS):
 def index():
     return render_template('index.html')
 
+@app.route('/sw.js')
+def service_worker():
+    #Service worker must be served from the root so its scope covers the whole app
+    return app.send_static_file('sw.js')
+
 @app.route('/api/download', methods=['POST'])
 def start_download():
     data = request.json

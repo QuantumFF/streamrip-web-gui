@@ -664,6 +664,12 @@ window.addEventListener('beforeunload', () => {
     }
 });
 
+if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/sw.js').catch((err) => {
+        console.log('Service worker registration failed:', err);
+    });
+}
+
 document.addEventListener('DOMContentLoaded', () => {
     const urlInput = document.getElementById('urlInput');
     if (urlInput) {
