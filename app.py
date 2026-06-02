@@ -110,17 +110,25 @@ class DownloadWorker(threading.Thread):
                 
                 process.wait()
 
+                full_output = "\n".join(output_lines)
+
                 if process.returncode != 0:
+                    status = 'failed'
                     logger.error(f"Download failed (exit code {process.returncode}): {' '.join(cmd)}")
                     logger.error("rip output (last 30 lines):\n%s", "\n".join(output_lines[-30:]))
+                elif re.search(r'Skipping track \d+', full_output) and '─ Downloading' not in full_output:
+                    #rip skipped every track (already in its database) and only fetched cover art
+                    status = 'skipped'
+                    logger.info(f"Already downloaded (marked in streamrip database): {url}")
+                else:
+                    status = 'completed'
 
                 broadcast_sse({
                     'type': 'download_completed',
                     'id': task_id,
-                    'status': 'completed' if process.returncode == 0 else 'failed',
+                    'status': status,
                     'metadata': metadata,
-                    'output': "\n".join(output_lines)
-
+                    'output': full_output
                 })
                             
             except Exception as e:

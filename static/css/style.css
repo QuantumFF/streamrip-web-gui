@@ -18,6 +18,7 @@
     --success: #00ff88;
     --error: #ff3333;
     --warning: #ffaa00;
+    --info: #00bbff;
 }
 
 body {
@@ -194,6 +195,10 @@ button:disabled {
 
 .download-item.failed {
     border-left: 3px solid var(--error);
+}
+
+.download-item.skipped {
+    border-left: 3px solid var(--info);
 }
 
 .download-content {
@@ -373,9 +378,14 @@ button:disabled {
     border-color: var(--success);
 }
 
-.status-badge.failed { 
+.status-badge.failed {
     color: var(--error);
     border-color: var(--error);
+}
+
+.status-badge.skipped {
+    color: var(--info);
+    border-color: var(--info);
 }
 
 .config-editor {
