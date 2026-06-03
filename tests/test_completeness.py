@@ -116,3 +116,27 @@ def test_slashed_totals_are_parsed():
     ])
     assert result['status'] == 'incomplete'
     assert result['missing'] == [{'disc': 1, 'track': 2}, {'disc': 1, 'track': 3}]
+
+
+def test_wholly_missing_disc_detected_via_disctotal():
+    # disctotal on a present track reveals the album has 2 discs; disc 2 has no
+    # present tracks at all -> incomplete, reported as a missing disc (its track
+    # count is unknowable from disk, so it is not enumerated in 'missing').
+    result = assess([
+        {'disc': '1', 'track': '1', 'tracktotal': '2', 'disctotal': '2'},
+    ])
+    assert result['status'] == 'incomplete'
+    assert result['missing'] == []
+    assert result['missing_discs'] == [2]
+    # The album-wide tracktotal counts the missing disc's track as unlocated.
+    assert result['unlocated'] == 1
+
+
+def test_no_missing_discs_when_all_discs_have_tracks():
+    result = assess([
+        {'disc': '1', 'track': '1', 'tracktotal': '2', 'disctotal': '2'},
+        {'disc': '2', 'track': '1', 'tracktotal': '2', 'disctotal': '2'},
+    ])
+    assert result['status'] == 'complete'
+    assert result['missing_discs'] == []
+    assert result['unlocated'] == 0

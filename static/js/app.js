@@ -499,6 +499,9 @@ async function loadLibrary() {
         }
 
         // Group albums under their artist to build the Artist -> Album tree.
+        // Albums at the download root have no artist directory (streamrip's
+        // default flat folder_format — the folder name carries the artist):
+        // they render ungrouped, without a fabricated artist header.
         const byArtist = new Map();
         albums.forEach(album => {
             if (!byArtist.has(album.artist)) {
@@ -507,19 +510,24 @@ async function loadLibrary() {
             byArtist.get(album.artist).push(album);
         });
 
-        container.innerHTML = Array.from(byArtist.entries()).map(([artist, artistAlbums]) => `
+        const renderAlbum = album => `
+            <div class="library-album" data-path="${escapeHtml(album.path)}">
+                <button class="library-album-header" onclick="toggleAlbum(this)">
+                    <span class="library-album-caret">▸</span>
+                    <span class="library-album-name">${escapeHtml(album.album)}</span>
+                    <span class="library-album-badge badge-pending" data-role="badge">…</span>
+                </button>
+                <div class="library-tracks"></div>
+            </div>
+        `;
+
+        container.innerHTML = Array.from(byArtist.entries()).map(([artist, artistAlbums]) =>
+            artist === null || artist === undefined || artist === ''
+                ? artistAlbums.map(renderAlbum).join('')
+                : `
             <div class="library-artist">
                 <div class="library-artist-name">${escapeHtml(artist)}</div>
-                ${artistAlbums.map(album => `
-                    <div class="library-album" data-path="${escapeHtml(album.path)}">
-                        <button class="library-album-header" onclick="toggleAlbum(this)">
-                            <span class="library-album-caret">▸</span>
-                            <span class="library-album-name">${escapeHtml(album.album)}</span>
-                            <span class="library-album-badge badge-pending" data-role="badge">…</span>
-                        </button>
-                        <div class="library-tracks"></div>
-                    </div>
-                `).join('')}
+                ${artistAlbums.map(renderAlbum).join('')}
             </div>
         `).join('');
 
@@ -547,8 +555,13 @@ function applyCompletenessBadge(albumEl, completeness) {
         badge.textContent = 'COMPLETE';
     } else if (status === 'incomplete') {
         const n = completeness.missing_count || 0;
+        const discs = completeness.missing_discs || [];
+        const parts = [];
+        if (n > 0) parts.push(`${n} missing`);
+        // A wholly missing disc has an unknowable track count — name the disc.
+        discs.forEach(d => parts.push(`disc ${d} missing`));
         badge.classList.add('badge-incomplete');
-        badge.textContent = `INCOMPLETE (${n} missing)`;
+        badge.textContent = `INCOMPLETE (${parts.join(', ')})`;
     } else {
         badge.classList.add('badge-unknown');
         badge.textContent = 'UNKNOWN';
@@ -615,10 +628,19 @@ async function toggleAlbum(button) {
             tracksEl.innerHTML = tracks.map(track => {
                 const num = track.tracknumber != null ? String(track.tracknumber).padStart(2, '0') : '--';
                 if (track.missing) {
+                    // A wholly missing disc gets one gap row (its track count is
+                    // unknowable from disk); unlocated absences (multi-disc
+                    // trailing gaps) get one summary row; a locatable missing
+                    // track names its number.
+                    const label = track.missing_disc
+                        ? `Disc ${escapeHtml(String(track.discnumber))} — missing entirely`
+                        : track.unlocated_count
+                            ? `${escapeHtml(String(track.unlocated_count))} track(s) missing — position unknown`
+                            : `Track ${escapeHtml(String(track.tracknumber))} — missing`;
                     return `
                         <div class="library-track library-track-missing">
                             <span class="library-track-number">${escapeHtml(num)}</span>
-                            <span class="library-track-title">Track ${escapeHtml(String(track.tracknumber))} — missing</span>
+                            <span class="library-track-title">${label}</span>
                         </div>
                     `;
                 }

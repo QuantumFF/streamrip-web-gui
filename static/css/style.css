@@ -1132,6 +1132,19 @@ button:disabled {
         height: 48px;
     }
 
+    /* History cards: let the row wrap so the redownload button drops to a
+       full-width line below the info instead of overflowing the viewport */
+    .download-content {
+        flex-wrap: wrap;
+    }
+
+    .redownload-btn {
+        flex-basis: 100%;
+        margin-left: 0;
+        padding: 12px 20px;
+        white-space: normal;
+    }
+
     .download-spinner {
         margin-right: 0;
     }

@@ -233,27 +233,59 @@ def test_album_endpoint_trailing_gap_rows(client, library, monkeypatch):
     assert [t['missing'] for t in rows] == [False, True, True]
 
 
-def test_album_endpoint_multi_disc_missing_against_disc(client, library, monkeypatch):
+def test_album_endpoint_multi_disc_interior_gap_against_disc(client, library, monkeypatch):
+    # streamrip tags tracktotal ALBUM-wide while tracknumber restarts per disc.
+    # An interior gap (disc 2 has tracks 1 and 3) is locatable from the numbering
+    # and reported against its disc.
     rel = os.path.relpath(
         _make_album(library, 'Artist', 'Album',
-                    ['d1t1.flac', 'd1t2.flac', 'd2t1.flac']),
+                    ['d1t1.flac', 'd1t2.flac', 'd2t1.flac', 'd2t3.flac']),
         library,
     )
     tags = {
-        'd1t1.flac': {'tracknumber': '1', 'discnumber': '1', 'tracktotal': '2', 'disctotal': '2'},
-        'd1t2.flac': {'tracknumber': '2', 'discnumber': '1', 'tracktotal': '2', 'disctotal': '2'},
-        'd2t1.flac': {'tracknumber': '1', 'discnumber': '2', 'tracktotal': '2', 'disctotal': '2'},
+        'd1t1.flac': {'tracknumber': '1', 'discnumber': '1', 'tracktotal': '5', 'disctotal': '2'},
+        'd1t2.flac': {'tracknumber': '2', 'discnumber': '1', 'tracktotal': '5', 'disctotal': '2'},
+        'd2t1.flac': {'tracknumber': '1', 'discnumber': '2', 'tracktotal': '5', 'disctotal': '2'},
+        'd2t3.flac': {'tracknumber': '3', 'discnumber': '2', 'tracktotal': '5', 'disctotal': '2'},
     }
     monkeypatch.setattr(app_module, 'read_audio_tags',
                         lambda fp: tags[os.path.basename(fp)])
 
     data = _tracks(client, rel).get_json()
     assert data['completeness']['status'] == 'incomplete'
-    # Disc 2 track 2 missing, reported against disc 2.
+    # Disc 2 track 2 missing, reported against disc 2; nothing unlocated.
     assert data['completeness']['missing'] == [{'disc': 2, 'track': 2}]
+    assert data['completeness']['unlocated'] == 0
     gap = [t for t in data['tracks'] if t['missing']]
     assert len(gap) == 1
     assert gap[0]['discnumber'] == 2 and gap[0]['tracknumber'] == 2
+
+
+def test_album_endpoint_multi_disc_trailing_gap_is_unlocated(client, library, monkeypatch):
+    # A trailing gap on a multi-disc album cannot be pinned to a disc (tracktotal
+    # is album-wide): the absent-track count is exact, the position unknown.
+    rel = os.path.relpath(
+        _make_album(library, 'Artist', 'Album',
+                    ['d1t1.flac', 'd1t2.flac', 'd2t1.flac']),
+        library,
+    )
+    tags = {
+        'd1t1.flac': {'tracknumber': '1', 'discnumber': '1', 'tracktotal': '4', 'disctotal': '2'},
+        'd1t2.flac': {'tracknumber': '2', 'discnumber': '1', 'tracktotal': '4', 'disctotal': '2'},
+        'd2t1.flac': {'tracknumber': '1', 'discnumber': '2', 'tracktotal': '4', 'disctotal': '2'},
+    }
+    monkeypatch.setattr(app_module, 'read_audio_tags',
+                        lambda fp: tags[os.path.basename(fp)])
+
+    data = _tracks(client, rel).get_json()
+    assert data['completeness']['status'] == 'incomplete'
+    assert data['completeness']['missing'] == []
+    assert data['completeness']['unlocated'] == 1
+    assert data['completeness']['missing_count'] == 1
+    # One summary gap row, sorted last.
+    rows = data['tracks']
+    assert rows[-1]['missing'] is True
+    assert rows[-1].get('unlocated_count') == 1
 
 
 def test_album_endpoint_no_tags_is_unknown(client, library, monkeypatch):
@@ -319,6 +351,110 @@ def test_assessment_cache_invalidated_when_folder_changes(client, library, monke
     data = _tracks(client, rel).get_json()
     assert data['completeness']['status'] == 'incomplete'
     assert data['completeness']['missing'] == [{'disc': 1, 'track': 2}]
+
+
+# --- streamrip's real on-disk layout (regression for the Library tree bug) ---
+# streamrip's default folder_format puts album folders FLAT at the download
+# root ("Artist - Album (Year) [FLAC] [...]"), with no artist directory level,
+# and multi-disc albums hold their audio in "Disc N" subfolders.
+
+
+def _make_flat_album(base, album, audio_files):
+    album_dir = os.path.join(base, album)
+    os.makedirs(album_dir, exist_ok=True)
+    for name in audio_files:
+        open(os.path.join(album_dir, name), 'wb').close()
+    return album_dir
+
+
+def test_flat_album_folder_has_no_fabricated_artist(client, library):
+    # A root-level album folder must not be grouped under "Unknown Artist" —
+    # the folder name already carries the artist; artist comes back null.
+    _make_flat_album(library, 'Radiohead - The Bends (1995) [FLAC]', ['01.flac'])
+
+    albums = _albums(client)
+    assert len(albums) == 1
+    assert albums[0]['album'] == 'Radiohead - The Bends (1995) [FLAC]'
+    assert albums[0]['artist'] is None
+
+
+def test_disc_subfolders_fold_into_one_album(client, library):
+    # A multi-disc album (audio in "Disc 1"/"Disc 2" subfolders) is ONE album —
+    # the parent folder — never two albums named "Disc 1" and "Disc 2" grouped
+    # under the album name as if it were an artist.
+    album = 'Radiohead - OK Computer OKNOTOK 1997 2017 (2017) [FLAC]'
+    _make_flat_album(library, os.path.join(album, 'Disc 1'), ['01.flac'])
+    _make_flat_album(library, os.path.join(album, 'Disc 2'), ['01.flac'])
+
+    albums = _albums(client)
+    assert len(albums) == 1
+    assert albums[0]['album'] == album
+    assert albums[0]['path'] == album
+    assert albums[0]['artist'] is None
+
+
+def test_nested_artist_album_layout_still_grouped(client, library):
+    # Users with a configured Artist/Album folder_format keep artist grouping.
+    _make_album(library, 'Radiohead', 'OK Computer', ['01.flac'])
+
+    albums = _albums(client)
+    assert len(albums) == 1
+    assert albums[0]['artist'] == 'Radiohead'
+    assert albums[0]['album'] == 'OK Computer'
+
+
+def test_album_tracks_collected_from_disc_subfolders(client, library, monkeypatch):
+    album = 'Artist - Album (2020) [FLAC]'
+    _make_flat_album(library, os.path.join(album, 'Disc 1'), ['d1t1.flac'])
+    _make_flat_album(library, os.path.join(album, 'Disc 2'), ['d2t1.flac'])
+
+    tags = {
+        'd1t1.flac': {'title': 'One', 'tracknumber': '1', 'discnumber': '1',
+                      'tracktotal': '2', 'disctotal': '2'},
+        'd2t1.flac': {'title': 'Two', 'tracknumber': '1', 'discnumber': '2',
+                      'tracktotal': '2', 'disctotal': '2'},
+    }
+    monkeypatch.setattr(app_module, 'read_audio_tags',
+                        lambda fp: tags[os.path.basename(fp)])
+
+    data = _tracks(client, album).get_json()
+    assert [t['title'] for t in data['tracks']] == ['One', 'Two']
+    # Both discs present and full -> the album as a whole is complete.
+    assert data['completeness']['status'] == 'complete'
+
+
+def test_cache_invalidated_when_disc_subfolder_changes(client, library, monkeypatch):
+    # Deleting a track inside "Disc 2" bumps only the subfolder's mtime, not the
+    # album folder's — the assessment cache must still be invalidated.
+    album = 'Artist - Album (2020) [FLAC]'
+    _make_flat_album(library, os.path.join(album, 'Disc 1'), ['d1t1.flac'])
+    d2 = _make_flat_album(library, os.path.join(album, 'Disc 2'), ['d2t1.flac'])
+    app_module.album_assessment_cache.clear()
+
+    tags = {
+        'd1t1.flac': {'title': 'One', 'tracknumber': '1', 'discnumber': '1',
+                      'tracktotal': '2', 'disctotal': '2'},
+        'd2t1.flac': {'title': 'Two', 'tracknumber': '1', 'discnumber': '2',
+                      'tracktotal': '2', 'disctotal': '2'},
+    }
+    monkeypatch.setattr(app_module, 'read_audio_tags',
+                        lambda fp: tags.get(os.path.basename(fp), {}))
+
+    assert _tracks(client, album).get_json()['completeness']['status'] == 'complete'
+
+    os.remove(os.path.join(d2, 'd2t1.flac'))
+    future = os.stat(d2).st_mtime + 10
+    os.utime(d2, (future, future))
+
+    data = _tracks(client, album).get_json()
+    assert data['completeness']['status'] == 'incomplete'
+    # Disc 2 vanished entirely: its track count is unknowable from disk, so it
+    # is reported as a wholly missing disc (revealed by disc 1's disctotal tag),
+    # not as enumerated missing tracks.
+    assert data['completeness']['missing'] == []
+    assert data['completeness']['missing_discs'] == [2]
+    disc_rows = [t for t in data['tracks'] if t.get('missing_disc')]
+    assert len(disc_rows) == 1 and disc_rows[0]['discnumber'] == 2
 
 
 def test_disc_number_orders_before_track_number(client, library, monkeypatch):

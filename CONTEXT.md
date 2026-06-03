@@ -58,8 +58,12 @@ embedded tags (`tracktotal`, `disctotal`, `tracknumber`, `discnumber`) of the
 tracks that *are* present, which streamrip writes into every file. An album is:
 
 - **Complete** — every expected (disc, track) is present on disk.
-- **Incomplete** — at least one expected track is absent. Each absent track is a
-  **Missing track**, identified by its number (its title is unknown, because a
-  track that was never downloaded left no tags on disk).
+- **Incomplete** — at least one expected track is absent. An absent track whose
+  position is determinable is a **Missing track**, identified by its number (its
+  title is unknown, because a track that was never downloaded left no tags on
+  disk). On a multi-disc album the tags carry only the album-wide total, so a
+  trailing absence there is counted exactly but its disc/position is unknown
+  (an **unlocated** absence); a disc with no tracks on disk at all is a
+  **Missing disc**.
 - **Unknown** — completeness cannot be determined, because no present track has
   readable tags to reveal the expected total.
