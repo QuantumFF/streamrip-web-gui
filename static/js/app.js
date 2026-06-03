@@ -178,12 +178,23 @@ function renderDownloadHistory() {
         const isOk = item.status === 'completed' || item.status === 'skipped';
         const statusIcon = isOk ? '✓' : '✗';
         const statusClass = isOk ? 'success' : 'error';
-        
+
+        // Every History entry whose source URL is known offers a Redownload
+        // (re-run with --no-db). On `skipped` ("already downloaded") items it is
+        // emphasized as the natural next action; elsewhere it stays quiet.
+        const isSkipped = item.status === 'skipped';
+        let redownloadAction = '';
+        if (item.url) {
+            redownloadAction = isSkipped
+                ? `<button class="redownload-btn prominent" onclick="redownload('${item.id}')">Already downloaded — Redownload anyway</button>`
+                : `<button class="redownload-btn" onclick="redownload('${item.id}')">Redownload</button>`;
+        }
+
         return `
-        <div class="download-item ${item.status}">
+        <div class="download-item ${item.status}" data-history-id="${item.id}">
             <div class="download-content">
-                ${item.metadata?.album_art ? 
-                    `<img src="${item.metadata.album_art}" class="download-album-art" onerror="this.style.display='none'">` : 
+                ${item.metadata?.album_art ?
+                    `<img src="${item.metadata.album_art}" class="download-album-art" onerror="this.style.display='none'">` :
                     `<div class="download-album-art placeholder ${statusClass}">${statusIcon}</div>`
                 }
                 <div class="download-info">
@@ -191,13 +202,44 @@ function renderDownloadHistory() {
                     <div class="download-artist">${item.metadata?.artist || 'Unknown Artist'}</div>
                     <div class="download-meta">
                         <span class="status-badge ${item.status}">${statusLabel(item.status)}</span>
-                        ${item.metadata?.service ? 
+                        ${item.metadata?.service ?
                             `<span class="service-badge">${item.metadata.service.toUpperCase()}</span>` : ''}
                     </div>
                 </div>
+                ${redownloadAction}
             </div>
         </div>
     `}).join('');
+}
+
+// Redownload a History entry: re-enqueue it bypassing streamrip's database
+// (--no-db) so an already-downloaded item downloads again. The new Download
+// enters the normal lifecycle and appears in the Active tab as queued.
+async function redownload(historyId) {
+    const btn = document.querySelector(`[data-history-id="${historyId}"] .redownload-btn`);
+    if (btn) {
+        btn.disabled = true;
+    }
+
+    try {
+        const response = await fetch('/api/redownload', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id: historyId })
+        });
+
+        const data = await response.json();
+
+        if (response.ok) {
+            switchTab('active');
+        } else {
+            alert(data.error || 'Failed to redownload');
+            if (btn) btn.disabled = false;
+        }
+    } catch (error) {
+        alert('Error: ' + error.message);
+        if (btn) btn.disabled = false;
+    }
 }
 
 

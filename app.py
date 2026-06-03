@@ -136,15 +136,20 @@ def register_queued(task):
     })
 
 
-def enqueue_download(url, quality=3, metadata=None):
+def enqueue_download(url, quality=3, metadata=None, no_db=False):
     """Create a Download, register it as Queued (visible immediately), and hand
-    it to a worker. Returns the task id."""
+    it to a worker. Returns the task id.
+
+    ``no_db`` forces a Redownload: the worker's `rip` invocation gets --no-db so
+    streamrip ignores its own database and downloads an already-recorded item
+    again (see the Redownload glossary entry)."""
     task_id = f"dl_{int(time.time() * 1000)}_{len(active_downloads)}"
     task = {
         'id': task_id,
         'url': url,
         'quality': quality,
         'metadata': metadata or {},
+        'no_db': no_db,
     }
     register_queued(task)
     download_queue.put(task)
@@ -980,10 +985,48 @@ def download_from_url():
         'status': 'queued',
         'metadata': metadata
     })
-    
-    
 
-        
+
+@app.route('/api/redownload', methods=['POST'])
+def redownload():
+    """Redownload a History entry, bypassing the Streamrip database.
+
+    Re-enqueues the item identified by its History ``id`` as a brand-new
+    Download, reusing the original URL, quality, and metadata, with --no-db so
+    streamrip ignores its own record and downloads it again even when it would
+    otherwise Skip (see the Redownload glossary entry). The new Download follows
+    the normal lifecycle: it is registered as Queued and visible immediately,
+    with a fresh id distinct from the original History entry."""
+    data = request.json or {}
+    entry_id = data.get('id')
+
+    if not entry_id:
+        return jsonify({'error': 'History entry id is required'}), 400
+
+    with history_lock:
+        entry = next((e for e in download_history if e['id'] == entry_id), None)
+
+    if entry is None:
+        return jsonify({'error': 'History entry not found'}), 404
+
+    url = entry.get('url')
+    if not url:
+        #Redownload is only meaningful for items whose source URL is known.
+        return jsonify({'error': 'History entry has no source URL to redownload'}), 400
+
+    quality = entry.get('quality')
+    if quality is None:
+        quality = 3
+    metadata = entry.get('metadata') or {}
+
+    task_id = enqueue_download(url, quality, metadata, no_db=True)
+
+    return jsonify({
+        'task_id': task_id,
+        'status': 'queued',
+        'metadata': metadata,
+    })
+
 
 if __name__ == '__main__':
     logger.info("Starting Streamrip Web application...")
