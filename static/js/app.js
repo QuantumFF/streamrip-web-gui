@@ -70,14 +70,20 @@ async function rehydrateState() {
         (data.active || []).forEach(item => {
             activeDownloads.set(item.id, {
                 id: item.id,
+                url: item.url,
+                quality: item.quality,
                 metadata: item.metadata || {},
                 status: item.status || 'queued',
                 output: ''
             });
         });
 
+        // History retains the original URL and quality (plus metadata) so the
+        // Redownload slice can re-run a History entry verbatim.
         downloadHistory = (data.history || []).map(item => ({
             id: item.id,
+            url: item.url,
+            quality: item.quality,
             metadata: item.metadata || {},
             status: item.status,
             output: item.output || '',
@@ -99,6 +105,8 @@ function handleDownloadQueued(data) {
     // when every worker is busy.
     activeDownloads.set(data.id, {
         id: data.id,
+        url: data.url,
+        quality: data.quality,
         metadata: data.metadata || {},
         status: 'queued',
         output: '',
@@ -116,6 +124,8 @@ function handleDownloadStarted(data) {
         id: data.id,
         output: ''
     };
+    download.url = data.url || download.url;
+    download.quality = data.quality != null ? data.quality : download.quality;
     download.metadata = data.metadata || download.metadata || {};
     download.status = 'downloading';
     download.startTime = Date.now();
@@ -204,6 +214,8 @@ function handleDownloadCompleted(data) {
     const download = activeDownloads.get(data.id);
     if (download) {
         download.status = data.status;
+        download.url = data.url || download.url;
+        download.quality = data.quality != null ? data.quality : download.quality;
         download.endTime = Date.now();
         download.output = data.output || (download.allOutput && download.allOutput.join('\n')) || 'No output captured';
         updateDownloadElement(data.id, download);

@@ -129,6 +129,8 @@ def register_queued(task):
     broadcast_sse({
         'type': 'download_queued',
         'id': record['id'],
+        'url': record['url'],
+        'quality': record['quality'],
         'metadata': record['metadata'],
         'status': 'queued',
     })
@@ -176,6 +178,8 @@ class DownloadWorker(threading.Thread):
             broadcast_sse({
                 'type': 'download_started',
                 'id': task_id,
+                'url': url,
+                'quality': quality,
                 'metadata': metadata,
                 'status': 'downloading'
             })
@@ -234,13 +238,18 @@ class DownloadWorker(threading.Thread):
 def finalize_download(task_id, status, metadata, output, error=None):
     """Move a Download out of Active into server-owned History with its terminal
     state, and broadcast the transition. History is appended server-side here so
-    it survives a page refresh (ADR-0002)."""
+    it survives a page refresh (ADR-0002).
+
+    The History entry retains the Download's original URL and quality (taken from
+    the Active record) alongside its metadata and final status, because the
+    Redownload slice re-runs a History entry from exactly those fields."""
     with active_lock:
         record = active_downloads.pop(task_id, None)
 
     entry = {
         'id': task_id,
         'url': record.get('url') if record else None,
+        'quality': record.get('quality') if record else None,
         'metadata': metadata or (record.get('metadata') if record else {}),
         'status': status,
         'output': output,
@@ -256,6 +265,8 @@ def finalize_download(task_id, status, metadata, output, error=None):
     broadcast_sse({
         'type': 'download_completed',
         'id': task_id,
+        'url': entry['url'],
+        'quality': entry['quality'],
         'status': status,
         'metadata': entry['metadata'],
         'output': output,

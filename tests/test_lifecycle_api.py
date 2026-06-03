@@ -113,6 +113,58 @@ def test_history_is_populated_server_side_for_rehydration(client):
     assert set(['id', 'status', 'metadata', 'completed_at']).issubset(entry.keys())
 
 
+def test_terminal_history_retains_url_and_quality(client):
+    # The Redownload slice re-runs a History entry from its retained URL +
+    # quality, so a terminal Download must land in History with both.
+    app_module.run_rip = fake_runner(["─ Downloading track 1"], returncode=0)
+    task_id = client.post(
+        '/api/download', json={'url': QOBUZ_URL, 'quality': 4}
+    ).get_json()['task_id']
+    assert wait_for(lambda: any(h['id'] == task_id for h in _history(client)))
+
+    entry = next(h for h in _history(client) if h['id'] == task_id)
+    assert entry['url'] == QOBUZ_URL
+    assert entry['quality'] == 4
+    assert entry['status'] == 'completed'
+
+
+def test_status_payload_shape(client):
+    # The status endpoint is the single rehydration source: Active (a list),
+    # History (a list), and the queue size in one payload.
+    data = client.get('/api/status').get_json()
+    assert set(['active', 'history', 'queue_size']).issubset(data.keys())
+    assert isinstance(data['active'], list)
+    assert isinstance(data['history'], list)
+    assert isinstance(data['queue_size'], int)
+
+
+def test_queued_items_present_in_status_before_any_worker_starts(client):
+    # Saturate every worker so the extra submissions cannot start, then prove
+    # they are already authoritative in /api/status as queued Active entries.
+    blocker = BlockingRunner()
+    app_module.run_rip = blocker
+
+    for _ in range(app_module.MAX_CONCURRENT_DOWNLOADS):
+        client.post('/api/download', json={'url': QOBUZ_URL, 'quality': 3})
+    assert blocker.wait_started(app_module.MAX_CONCURRENT_DOWNLOADS)
+
+    extra = 3
+    queued_ids = []
+    for _ in range(extra):
+        r = client.post('/api/download', json={'url': QOBUZ_URL, 'quality': 3})
+        queued_ids.append(r.get_json()['task_id'])
+
+    active = _active_ids(client)
+    for task_id in queued_ids:
+        assert task_id in active
+        assert active[task_id]['status'] == 'queued'
+        # Active entries carry the fields rehydration and Redownload rely on.
+        assert active[task_id]['url'] == QOBUZ_URL
+        assert active[task_id]['quality'] == 3
+
+    blocker.release.set()
+
+
 def test_unsupported_url_is_rejected_and_not_queued(client):
     resp = client.post('/api/download', json={'url': 'https://example.com/x'})
     assert resp.status_code == 400
