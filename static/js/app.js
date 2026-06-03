@@ -13,6 +13,39 @@ let activeDownloads = new Map();
 let downloadHistory = [];
 
 
+// Non-blocking, stacking, auto-dismissing toast. Replaces every alert() so user
+// feedback (Download accepted/failed, config saved, search/connection errors)
+// never blocks the page or yanks focus. `type` is 'success' | 'error' | 'info'.
+function showToast(message, type = 'info', duration = 4000) {
+    const container = document.getElementById('toastContainer');
+    if (!container) return;
+
+    const toast = document.createElement('div');
+    toast.className = `toast ${type}`;
+    toast.textContent = message;
+    toast.setAttribute('role', type === 'error' ? 'alert' : 'status');
+
+    const dismiss = () => {
+        if (toast.dataset.dismissed) return;
+        toast.dataset.dismissed = '1';
+        toast.classList.remove('visible');
+        // Wait for the fade-out transition before removing from the DOM.
+        setTimeout(() => toast.remove(), 200);
+    };
+
+    toast.addEventListener('click', dismiss);
+    container.appendChild(toast);
+    // Force a reflow so the entrance transition runs from the hidden state.
+    requestAnimationFrame(() => toast.classList.add('visible'));
+
+    if (duration > 0) {
+        setTimeout(dismiss, duration);
+    }
+
+    return toast;
+}
+
+
 function initializeSSE() {
     if (eventSource) {
         eventSource.close();
@@ -33,8 +66,11 @@ function initializeSSE() {
 }
 
 function handleSSEMessage(data) {
-    
+
     switch(data.type) {
+        case 'download_queued':
+            handleDownloadQueued(data);
+            break;
         case 'download_started':
             handleDownloadStarted(data);
             break;
@@ -47,24 +83,90 @@ function handleSSEMessage(data) {
         case 'download_error':
             handleDownloadError(data);
             break;
-		case 'heartbeat':
-			console.log('badump')
+        case 'connected':
+        case 'heartbeat':
+            break;
         default:
             console.log('Unknown SSE message type:', data.type);
     }
 }
 
-function handleDownloadStarted(data) {
+// Pull the authoritative Active list + History from the server (ADR-0002) so a
+// page refresh loses nothing. Runs before live SSE deltas are processed.
+async function rehydrateState() {
+    try {
+        const response = await fetch('/api/status');
+        if (!response.ok) return;
+        const data = await response.json();
+
+        activeDownloads.clear();
+        (data.active || []).forEach(item => {
+            activeDownloads.set(item.id, {
+                id: item.id,
+                url: item.url,
+                quality: item.quality,
+                metadata: item.metadata || {},
+                status: item.status || 'queued',
+                output: ''
+            });
+        });
+
+        // History retains the original URL and quality (plus metadata) so the
+        // Redownload slice can re-run a History entry verbatim.
+        downloadHistory = (data.history || []).map(item => ({
+            id: item.id,
+            url: item.url,
+            quality: item.quality,
+            metadata: item.metadata || {},
+            status: item.status,
+            output: item.output || '',
+            completedAt: item.completed_at ? item.completed_at * 1000 : Date.now()
+        }));
+    } catch (error) {
+        console.error('Failed to rehydrate state:', error);
+    } finally {
+        if (currentTab === 'active') {
+            renderActiveDownloads();
+        } else if (currentTab === 'history') {
+            renderDownloadHistory();
+        }
+    }
+}
+
+function handleDownloadQueued(data) {
+    // A Queued card appears the instant the server accepts a Download, even
+    // when every worker is busy.
     activeDownloads.set(data.id, {
         id: data.id,
-        metadata: data.metadata,
-        status: 'downloading',
-        progress: 0,
-        output: [],
-        startTime: Date.now()
+        url: data.url,
+        quality: data.quality,
+        metadata: data.metadata || {},
+        status: 'queued',
+        output: '',
+        queuedAt: Date.now()
     });
-    
+
     if (currentTab === 'active') {
+        renderActiveDownloads();
+    }
+}
+
+function handleDownloadStarted(data) {
+    // Transition the existing Queued card in place to Downloading.
+    const download = activeDownloads.get(data.id) || {
+        id: data.id,
+        output: ''
+    };
+    download.url = data.url || download.url;
+    download.quality = data.quality != null ? data.quality : download.quality;
+    download.metadata = data.metadata || download.metadata || {};
+    download.status = 'downloading';
+    download.startTime = Date.now();
+    activeDownloads.set(data.id, download);
+
+    if (currentTab === 'active') {
+        // Re-render so the card gains its spinner; updateDownloadElement alone
+        // cannot add the spinner that a Queued card lacks.
         renderActiveDownloads();
     }
 }
@@ -109,12 +211,23 @@ function renderDownloadHistory() {
         const isOk = item.status === 'completed' || item.status === 'skipped';
         const statusIcon = isOk ? '✓' : '✗';
         const statusClass = isOk ? 'success' : 'error';
-        
+
+        // Every History entry whose source URL is known offers a Redownload
+        // (re-run with --no-db). On `skipped` ("already downloaded") items it is
+        // emphasized as the natural next action; elsewhere it stays quiet.
+        const isSkipped = item.status === 'skipped';
+        let redownloadAction = '';
+        if (item.url) {
+            redownloadAction = isSkipped
+                ? `<button class="redownload-btn prominent" onclick="redownload('${item.id}')">Already downloaded — Redownload anyway</button>`
+                : `<button class="redownload-btn" onclick="redownload('${item.id}')">Redownload</button>`;
+        }
+
         return `
-        <div class="download-item ${item.status}">
+        <div class="download-item ${item.status}" data-history-id="${item.id}">
             <div class="download-content">
-                ${item.metadata?.album_art ? 
-                    `<img src="${item.metadata.album_art}" class="download-album-art" onerror="this.style.display='none'">` : 
+                ${item.metadata?.album_art ?
+                    `<img src="${item.metadata.album_art}" class="download-album-art" onerror="this.style.display='none'">` :
                     `<div class="download-album-art placeholder ${statusClass}">${statusIcon}</div>`
                 }
                 <div class="download-info">
@@ -122,13 +235,44 @@ function renderDownloadHistory() {
                     <div class="download-artist">${item.metadata?.artist || 'Unknown Artist'}</div>
                     <div class="download-meta">
                         <span class="status-badge ${item.status}">${statusLabel(item.status)}</span>
-                        ${item.metadata?.service ? 
+                        ${item.metadata?.service ?
                             `<span class="service-badge">${item.metadata.service.toUpperCase()}</span>` : ''}
                     </div>
                 </div>
+                ${redownloadAction}
             </div>
         </div>
     `}).join('');
+}
+
+// Redownload a History entry: re-enqueue it bypassing streamrip's database
+// (--no-db) so an already-downloaded item downloads again. The new Download
+// enters the normal lifecycle and appears in the Active tab as queued.
+async function redownload(historyId) {
+    const btn = document.querySelector(`[data-history-id="${historyId}"] .redownload-btn`);
+    if (btn) {
+        btn.disabled = true;
+    }
+
+    try {
+        const response = await fetch('/api/redownload', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id: historyId })
+        });
+
+        const data = await response.json();
+
+        if (response.ok) {
+            showToast('Redownload queued', 'success');
+        } else {
+            showToast(data.error || 'Failed to redownload', 'error');
+            if (btn) btn.disabled = false;
+        }
+    } catch (error) {
+        showToast('Error: ' + error.message, 'error');
+        if (btn) btn.disabled = false;
+    }
 }
 
 
@@ -145,8 +289,10 @@ function handleDownloadCompleted(data) {
     const download = activeDownloads.get(data.id);
     if (download) {
         download.status = data.status;
+        download.url = data.url || download.url;
+        download.quality = data.quality != null ? data.quality : download.quality;
         download.endTime = Date.now();
-        download.output = data.output || download.allOutput.join('\n') || 'No output captured';
+        download.output = data.output || (download.allOutput && download.allOutput.join('\n')) || 'No output captured';
         updateDownloadElement(data.id, download);
         
         setTimeout(() => {
@@ -217,7 +363,7 @@ function renderActiveDownloads() {
                     </div>
                     ${item.output ? `<a class="toggle-output" onclick="toggleOutput('${item.id}')">SHOW OUTPUT</a>` : ''}
                 </div>
-                <div class="download-spinner"></div>
+                ${item.status === 'downloading' ? '<div class="download-spinner"></div>' : ''}
             </div>
             ${item.output ? `
                 <div class="download-output">
@@ -259,7 +405,7 @@ function switchTab(tab, element) {
     } else if (tab === 'config') {
         loadConfig();
     } else if (tab === 'files') {
-        loadFiles();
+        loadLibrary();
     }
 }
 
@@ -268,30 +414,32 @@ async function startDownload() {
     const quality = document.getElementById('qualitySelect').value;
     
     if (!url) {
-        alert('Please enter a URL');
+        showToast('Please enter a URL', 'error');
         return;
     }
-    
+
     const btn = document.getElementById('downloadBtn');
     btn.disabled = true;
-    
+
     try {
         const response = await fetch('/api/download', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ url, quality: parseInt(quality) })
         });
-        
+
         const data = await response.json();
-        
+
         if (response.ok) {
             document.getElementById('urlInput').value = '';
-            document.querySelector('.tab').click();
+            // The toast confirms acceptance; the user chooses when to look at the
+            // Active tab, so we no longer yank them there on submit.
+            showToast('Queued', 'success');
         } else {
-            alert(data.error || 'Failed to start download');
+            showToast(data.error || 'Failed to start download', 'error');
         }
     } catch (error) {
-        alert('Error: ' + error.message);
+        showToast('Error: ' + error.message, 'error');
     } finally {
         btn.disabled = false;
     }
@@ -304,7 +452,7 @@ async function loadConfig() {
         const data = await response.json();
         document.getElementById('configEditor').value = data.config || '';
     } catch (error) {
-        alert('Failed to load config: ' + error.message);
+        showToast('Failed to load config: ' + error.message, 'error');
     }
 }
 
@@ -319,39 +467,195 @@ async function saveConfig() {
         });
         
         if (response.ok) {
-            alert('Config saved successfully');
+            showToast('Config saved successfully', 'success');
         } else {
             const data = await response.json();
-            alert('Failed to save config: ' + (data.error || 'Unknown error'));
+            showToast('Failed to save config: ' + (data.error || 'Unknown error'), 'error');
         }
     } catch (error) {
-        alert('Error: ' + error.message);
+        showToast('Error: ' + error.message, 'error');
     }
 }
 
-async function loadFiles() {
+// The Library view: an Artist -> Album -> Track tree over the albums on disk.
+// The album list comes back instantly (no tags read server-side); a given
+// album's tracks are fetched lazily the first time it is expanded. Read-only:
+// a folder on disk carries no source URL, so there is no Redownload here.
+async function loadLibrary() {
+    const container = document.getElementById('libraryTree');
+    container.innerHTML = '<div class="empty-state">LOADING LIBRARY...</div>';
     try {
-        const response = await fetch('/api/browse');
-        const files = await response.json();
-        
-        const container = document.getElementById('fileList');
-        
-        if (files.length === 0) {
-            container.innerHTML = '<div class="empty-state">NO FILES FOUND</div>';
+        const response = await fetch('/api/library');
+        const data = await response.json();
+
+        if (!response.ok) {
+            throw new Error(data.error || 'Failed to load library');
+        }
+
+        const albums = data.albums || [];
+        if (albums.length === 0) {
+            container.innerHTML = '<div class="empty-state">NO ALBUMS FOUND</div>';
             return;
         }
-        
-        container.innerHTML = files.map(file => `
-            <div class="file-item">
-                <div class="file-name">${file.name}</div>
-                <div class="file-meta">
-                    ${(file.size / 1024 / 1024).toFixed(2)} MB • 
-                    ${new Date(file.modified * 1000).toLocaleDateString()}
-                </div>
+
+        // Group albums under their artist to build the Artist -> Album tree.
+        // Albums at the download root have no artist directory (streamrip's
+        // default flat folder_format — the folder name carries the artist):
+        // they render ungrouped, without a fabricated artist header.
+        const byArtist = new Map();
+        albums.forEach(album => {
+            if (!byArtist.has(album.artist)) {
+                byArtist.set(album.artist, []);
+            }
+            byArtist.get(album.artist).push(album);
+        });
+
+        const renderAlbum = album => `
+            <div class="library-album" data-path="${escapeHtml(album.path)}">
+                <button class="library-album-header" onclick="toggleAlbum(this)">
+                    <span class="library-album-caret">▸</span>
+                    <span class="library-album-name">${escapeHtml(album.album)}</span>
+                    <span class="library-album-badge badge-pending" data-role="badge">…</span>
+                </button>
+                <div class="library-tracks"></div>
+            </div>
+        `;
+
+        container.innerHTML = Array.from(byArtist.entries()).map(([artist, artistAlbums]) =>
+            artist === null || artist === undefined || artist === ''
+                ? artistAlbums.map(renderAlbum).join('')
+                : `
+            <div class="library-artist">
+                <div class="library-artist-name">${escapeHtml(artist)}</div>
+                ${artistAlbums.map(renderAlbum).join('')}
             </div>
         `).join('');
+
+        // Every album carries a completeness badge (ADR-0003). The badge is
+        // derived from embedded tags, so it is filled lazily per album from the
+        // per-album endpoint (cached server-side on folder mtime) without
+        // blocking the instant, tag-free album listing above.
+        document.querySelectorAll('#libraryTree .library-album').forEach(loadAlbumBadge);
     } catch (error) {
-        alert('Failed to load files: ' + error.message);
+        container.innerHTML = '<div class="empty-state">FAILED TO LOAD LIBRARY</div>';
+        showToast('Failed to load library: ' + error.message, 'error');
+    }
+}
+
+// Render a completeness badge into an album's header: COMPLETE / INCOMPLETE
+// (n missing) / UNKNOWN. Caches the fetched album payload on the element so
+// expanding it later reuses it without a second request.
+function applyCompletenessBadge(albumEl, completeness) {
+    const badge = albumEl.querySelector('[data-role="badge"]');
+    if (!badge) return;
+    const status = completeness ? completeness.status : 'unknown';
+    badge.classList.remove('badge-pending', 'badge-complete', 'badge-incomplete', 'badge-unknown');
+    if (status === 'complete') {
+        badge.classList.add('badge-complete');
+        badge.textContent = 'COMPLETE';
+    } else if (status === 'incomplete') {
+        const n = completeness.missing_count || 0;
+        const discs = completeness.missing_discs || [];
+        const parts = [];
+        if (n > 0) parts.push(`${n} missing`);
+        // A wholly missing disc has an unknowable track count — name the disc.
+        discs.forEach(d => parts.push(`disc ${d} missing`));
+        badge.classList.add('badge-incomplete');
+        badge.textContent = `INCOMPLETE (${parts.join(', ')})`;
+    } else {
+        badge.classList.add('badge-unknown');
+        badge.textContent = 'UNKNOWN';
+    }
+}
+
+async function loadAlbumBadge(albumEl) {
+    const path = albumEl.dataset.path;
+    try {
+        const response = await fetch('/api/library/album?path=' + encodeURIComponent(path));
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Failed');
+        // Stash the payload so toggleAlbum reuses it (server already cached it).
+        albumEl._albumData = data;
+        applyCompletenessBadge(albumEl, data.completeness);
+    } catch (error) {
+        applyCompletenessBadge(albumEl, { status: 'unknown' });
+    }
+}
+
+async function toggleAlbum(button) {
+    const albumEl = button.closest('.library-album');
+    const tracksEl = albumEl.querySelector('.library-tracks');
+    const caret = button.querySelector('.library-album-caret');
+
+    // Collapse if already expanded.
+    if (albumEl.classList.contains('expanded')) {
+        albumEl.classList.remove('expanded');
+        caret.textContent = '▸';
+        return;
+    }
+
+    albumEl.classList.add('expanded');
+    caret.textContent = '▾';
+
+    // Lazily fetch this album's tracks only the first time it is expanded.
+    if (albumEl.dataset.loaded === 'true') {
+        return;
+    }
+
+    const path = albumEl.dataset.path;
+    tracksEl.innerHTML = '<div class="library-tracks-loading">LOADING TRACKS...</div>';
+
+    try {
+        // Reuse the payload the badge already fetched (the server caches it on
+        // folder mtime, so this would hit that cache anyway).
+        let data = albumEl._albumData;
+        if (!data) {
+            const response = await fetch('/api/library/album?path=' + encodeURIComponent(path));
+            data = await response.json();
+            if (!response.ok) {
+                throw new Error(data.error || 'Failed to load tracks');
+            }
+            albumEl._albumData = data;
+        }
+        applyCompletenessBadge(albumEl, data.completeness);
+
+        const tracks = data.tracks || [];
+        if (tracks.length === 0) {
+            tracksEl.innerHTML = '<div class="library-tracks-empty">NO TRACKS</div>';
+        } else {
+            // The expected sequence 1…tracktotal per disc, with absent tracks as
+            // greyed, number-only "Track N — missing" rows (ADR-0003).
+            tracksEl.innerHTML = tracks.map(track => {
+                const num = track.tracknumber != null ? String(track.tracknumber).padStart(2, '0') : '--';
+                if (track.missing) {
+                    // A wholly missing disc gets one gap row (its track count is
+                    // unknowable from disk); unlocated absences (multi-disc
+                    // trailing gaps) get one summary row; a locatable missing
+                    // track names its number.
+                    const label = track.missing_disc
+                        ? `Disc ${escapeHtml(String(track.discnumber))} — missing entirely`
+                        : track.unlocated_count
+                            ? `${escapeHtml(String(track.unlocated_count))} track(s) missing — position unknown`
+                            : `Track ${escapeHtml(String(track.tracknumber))} — missing`;
+                    return `
+                        <div class="library-track library-track-missing">
+                            <span class="library-track-number">${escapeHtml(num)}</span>
+                            <span class="library-track-title">${label}</span>
+                        </div>
+                    `;
+                }
+                return `
+                    <div class="library-track">
+                        <span class="library-track-number">${escapeHtml(num)}</span>
+                        <span class="library-track-title">${escapeHtml(track.title || '')}</span>
+                    </div>
+                `;
+            }).join('');
+        }
+        albumEl.dataset.loaded = 'true';
+    } catch (error) {
+        tracksEl.innerHTML = '<div class="library-tracks-empty">FAILED TO LOAD TRACKS</div>';
+        showToast('Failed to load tracks: ' + error.message, 'error');
     }
 }
 
@@ -366,7 +670,7 @@ async function searchMusic() {
     const source = document.getElementById('searchSource').value;
     
     if (!query) {
-        alert('Please enter a search query');
+        showToast('Please enter a search query', 'error');
         return;
     }
     
@@ -415,6 +719,7 @@ async function searchMusic() {
             
             errorHtml += `</div>`;
             resultsDiv.innerHTML = errorHtml;
+            showToast(errorMsg, 'error');
             updatePaginationControls();
             return;
         }
@@ -436,6 +741,7 @@ async function searchMusic() {
             <div class="error-title">⚠ CONNECTION ERROR</div>
             <div class="error-message">${escapeHtml(error.message)}</div>
         </div>`;
+        showToast('Connection error: ' + error.message, 'error');
         updatePaginationControls();
     }
 }
@@ -629,32 +935,37 @@ async function downloadFromUrl(url) {
         }
     });
     
-    switchTab('active');
-    
     try {
         const response = await fetch('/api/download-from-url', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ 
+            body: JSON.stringify({
                 url: url,
                 quality: parseInt(quality),
                 ...metadata
             })
         });
-        
+
         const data = await response.json();
-        
-        if (!response.ok) {
-            alert('Failed to start download: ' + (data.error || 'Unknown error'));
+
+        if (response.ok) {
+            // Confirm acceptance via toast and leave the user on Search; they
+            // choose when to switch to the Active tab.
+            showToast('Queued', 'success');
+        } else {
+            showToast('Failed to start download: ' + (data.error || 'Unknown error'), 'error');
         }
-        
+
     } catch (error) {
-        alert('Error: ' + error.message);
+        showToast('Error: ' + error.message, 'error');
     }
 }
 
 
 window.addEventListener('load', () => {
+    // Rehydrate authoritative server state first (ADR-0002), then attach the
+    // live SSE delta channel on top of it.
+    rehydrateState();
     initializeSSE();
 });
 

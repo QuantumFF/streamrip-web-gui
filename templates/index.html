@@ -111,9 +111,9 @@
             </div>
             
             <div id="filesTab" class="tab-content">
-                <button onclick="loadFiles()" class="secondary-btn">REFRESH FILES</button>
-                <div id="fileList" class="file-list">
-                    <div class="empty-state">CLICK REFRESH TO LOAD FILES</div>
+                <button onclick="loadLibrary()" class="secondary-btn">REFRESH LIBRARY</button>
+                <div id="libraryTree" class="library-tree">
+                    <div class="empty-state">CLICK REFRESH TO LOAD LIBRARY</div>
                 </div>
             </div>
             
@@ -126,7 +126,9 @@
             </div>
         </div>
     </div>
-    
+
+    <div id="toastContainer" class="toast-container" aria-live="polite" aria-atomic="false"></div>
+
     <script src="{{ url_for('static', filename='js/app.js') }}"></script>
 </body>
 </html>

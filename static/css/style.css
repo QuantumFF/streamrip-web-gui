@@ -185,6 +185,10 @@ button:disabled {
     border-color: var(--text-tertiary);
 }
 
+.download-item.queued {
+    border-left: 3px solid var(--text-tertiary);
+}
+
 .download-item.downloading {
     border-left: 3px solid var(--warning);
 }
@@ -206,6 +210,33 @@ button:disabled {
     gap: 15px;
     align-items: center;
     position: relative;
+}
+
+/* Redownload action on History cards. Quiet by default (sits to the right of
+   the card), and emphasized on `skipped` ("already downloaded") items. */
+.redownload-btn {
+    margin-left: auto;
+    flex-shrink: 0;
+    padding: 8px 14px;
+    font-size: 10px;
+    border-color: var(--border);
+    color: var(--text-secondary);
+    white-space: nowrap;
+}
+
+.redownload-btn:hover:not(:disabled) {
+    background: var(--accent);
+    color: var(--bg-primary);
+}
+
+.redownload-btn.prominent {
+    border-color: var(--info);
+    color: var(--info);
+}
+
+.redownload-btn.prominent:hover:not(:disabled) {
+    background: var(--info);
+    color: var(--bg-primary);
 }
 
 .download-spinner {
@@ -443,6 +474,142 @@ button:disabled {
     font-size: 11px;
     color: var(--text-tertiary);
     margin-left: 20px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+/* Library tree: Artist -> Album -> Track */
+.library-tree {
+    max-height: 500px;
+    overflow-y: auto;
+    margin-top: 20px;
+}
+
+.library-artist {
+    margin-bottom: 16px;
+}
+
+.library-artist-name {
+    font-size: 12px;
+    color: var(--text-tertiary);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding: 6px 4px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 6px;
+}
+
+.library-album {
+    margin-bottom: 4px;
+}
+
+.library-album-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    text-align: left;
+    padding: 10px 12px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    color: var(--text-primary);
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 13px;
+    cursor: pointer;
+    transition: border-color 0.2s;
+}
+
+.library-album-header:hover {
+    border-color: var(--text-tertiary);
+}
+
+.library-album-caret {
+    color: var(--text-tertiary);
+    font-size: 11px;
+    width: 12px;
+    flex-shrink: 0;
+}
+
+.library-album-name {
+    flex: 1;
+    word-break: break-word;
+}
+
+/* Album completeness badge (ADR-0003): COMPLETE / INCOMPLETE (n missing) /
+   UNKNOWN. Derived entirely from embedded tags of present tracks. */
+.library-album-badge {
+    flex-shrink: 0;
+    font-size: 10px;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    padding: 2px 8px;
+    border: 1px solid var(--border);
+    border-radius: 2px;
+    white-space: nowrap;
+}
+
+.library-album-badge.badge-pending {
+    color: var(--text-tertiary);
+    border-color: var(--border);
+}
+
+.library-album-badge.badge-complete {
+    color: var(--success);
+    border-color: var(--success);
+}
+
+.library-album-badge.badge-incomplete {
+    color: var(--warning);
+    border-color: var(--warning);
+}
+
+.library-album-badge.badge-unknown {
+    color: var(--text-tertiary);
+    border-color: var(--text-tertiary);
+}
+
+.library-tracks {
+    display: none;
+    padding-left: 20px;
+}
+
+.library-album.expanded .library-tracks {
+    display: block;
+}
+
+.library-track {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    padding: 7px 12px;
+    border-left: 1px solid var(--border);
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+
+.library-track-number {
+    color: var(--text-tertiary);
+    flex-shrink: 0;
+}
+
+/* A missing track (never downloaded, no tags on disk): greyed, number-only,
+   rendered in its sequence position so interior and trailing gaps are visible. */
+.library-track-missing {
+    color: var(--text-tertiary);
+    font-style: italic;
+    opacity: 0.7;
+}
+
+.library-track-title {
+    word-break: break-word;
+}
+
+.library-tracks-loading,
+.library-tracks-empty {
+    padding: 8px 12px;
+    font-size: 11px;
+    color: var(--text-tertiary);
     text-transform: uppercase;
     letter-spacing: 0.5px;
 }
@@ -965,6 +1132,19 @@ button:disabled {
         height: 48px;
     }
 
+    /* History cards: let the row wrap so the redownload button drops to a
+       full-width line below the info instead of overflowing the viewport */
+    .download-content {
+        flex-wrap: wrap;
+    }
+
+    .redownload-btn {
+        flex-basis: 100%;
+        margin-left: 0;
+        padding: 12px 20px;
+        white-space: normal;
+    }
+
     .download-spinner {
         margin-right: 0;
     }
@@ -996,5 +1176,63 @@ button:disabled {
     .tab {
         font-size: 10px;
         letter-spacing: 0.5px;
+    }
+}
+
+/* Toast notifications — non-blocking, stacking, auto-dismissing feedback that
+   replaces every blocking alert() call site. */
+.toast-container {
+    position: fixed;
+    bottom: 24px;
+    right: 24px;
+    z-index: 1000;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    max-width: min(360px, calc(100vw - 48px));
+    pointer-events: none;
+}
+
+.toast {
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--text-tertiary);
+    color: var(--text-primary);
+    padding: 12px 16px;
+    font-size: 12px;
+    letter-spacing: 0.5px;
+    line-height: 1.4;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+    pointer-events: auto;
+    cursor: pointer;
+    word-break: break-word;
+    opacity: 0;
+    transform: translateX(20px);
+    transition: opacity 0.2s ease, transform 0.2s ease;
+}
+
+.toast.visible {
+    opacity: 1;
+    transform: translateX(0);
+}
+
+.toast.success {
+    border-left-color: var(--success);
+}
+
+.toast.error {
+    border-left-color: var(--error);
+}
+
+.toast.info {
+    border-left-color: var(--info);
+}
+
+@media (max-width: 600px) {
+    .toast-container {
+        left: 16px;
+        right: 16px;
+        bottom: 16px;
+        max-width: none;
     }
 }
