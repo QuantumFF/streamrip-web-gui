@@ -13,6 +13,39 @@ let activeDownloads = new Map();
 let downloadHistory = [];
 
 
+// Non-blocking, stacking, auto-dismissing toast. Replaces every alert() so user
+// feedback (Download accepted/failed, config saved, search/connection errors)
+// never blocks the page or yanks focus. `type` is 'success' | 'error' | 'info'.
+function showToast(message, type = 'info', duration = 4000) {
+    const container = document.getElementById('toastContainer');
+    if (!container) return;
+
+    const toast = document.createElement('div');
+    toast.className = `toast ${type}`;
+    toast.textContent = message;
+    toast.setAttribute('role', type === 'error' ? 'alert' : 'status');
+
+    const dismiss = () => {
+        if (toast.dataset.dismissed) return;
+        toast.dataset.dismissed = '1';
+        toast.classList.remove('visible');
+        // Wait for the fade-out transition before removing from the DOM.
+        setTimeout(() => toast.remove(), 200);
+    };
+
+    toast.addEventListener('click', dismiss);
+    container.appendChild(toast);
+    // Force a reflow so the entrance transition runs from the hidden state.
+    requestAnimationFrame(() => toast.classList.add('visible'));
+
+    if (duration > 0) {
+        setTimeout(dismiss, duration);
+    }
+
+    return toast;
+}
+
+
 function initializeSSE() {
     if (eventSource) {
         eventSource.close();
@@ -231,13 +264,13 @@ async function redownload(historyId) {
         const data = await response.json();
 
         if (response.ok) {
-            switchTab('active');
+            showToast('Redownload queued', 'success');
         } else {
-            alert(data.error || 'Failed to redownload');
+            showToast(data.error || 'Failed to redownload', 'error');
             if (btn) btn.disabled = false;
         }
     } catch (error) {
-        alert('Error: ' + error.message);
+        showToast('Error: ' + error.message, 'error');
         if (btn) btn.disabled = false;
     }
 }
@@ -381,30 +414,32 @@ async function startDownload() {
     const quality = document.getElementById('qualitySelect').value;
     
     if (!url) {
-        alert('Please enter a URL');
+        showToast('Please enter a URL', 'error');
         return;
     }
-    
+
     const btn = document.getElementById('downloadBtn');
     btn.disabled = true;
-    
+
     try {
         const response = await fetch('/api/download', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ url, quality: parseInt(quality) })
         });
-        
+
         const data = await response.json();
-        
+
         if (response.ok) {
             document.getElementById('urlInput').value = '';
-            document.querySelector('.tab').click();
+            // The toast confirms acceptance; the user chooses when to look at the
+            // Active tab, so we no longer yank them there on submit.
+            showToast('Queued', 'success');
         } else {
-            alert(data.error || 'Failed to start download');
+            showToast(data.error || 'Failed to start download', 'error');
         }
     } catch (error) {
-        alert('Error: ' + error.message);
+        showToast('Error: ' + error.message, 'error');
     } finally {
         btn.disabled = false;
     }
@@ -417,7 +452,7 @@ async function loadConfig() {
         const data = await response.json();
         document.getElementById('configEditor').value = data.config || '';
     } catch (error) {
-        alert('Failed to load config: ' + error.message);
+        showToast('Failed to load config: ' + error.message, 'error');
     }
 }
 
@@ -432,13 +467,13 @@ async function saveConfig() {
         });
         
         if (response.ok) {
-            alert('Config saved successfully');
+            showToast('Config saved successfully', 'success');
         } else {
             const data = await response.json();
-            alert('Failed to save config: ' + (data.error || 'Unknown error'));
+            showToast('Failed to save config: ' + (data.error || 'Unknown error'), 'error');
         }
     } catch (error) {
-        alert('Error: ' + error.message);
+        showToast('Error: ' + error.message, 'error');
     }
 }
 
@@ -464,7 +499,7 @@ async function loadFiles() {
             </div>
         `).join('');
     } catch (error) {
-        alert('Failed to load files: ' + error.message);
+        showToast('Failed to load files: ' + error.message, 'error');
     }
 }
 
@@ -479,7 +514,7 @@ async function searchMusic() {
     const source = document.getElementById('searchSource').value;
     
     if (!query) {
-        alert('Please enter a search query');
+        showToast('Please enter a search query', 'error');
         return;
     }
     
@@ -528,6 +563,7 @@ async function searchMusic() {
             
             errorHtml += `</div>`;
             resultsDiv.innerHTML = errorHtml;
+            showToast(errorMsg, 'error');
             updatePaginationControls();
             return;
         }
@@ -549,6 +585,7 @@ async function searchMusic() {
             <div class="error-title">⚠ CONNECTION ERROR</div>
             <div class="error-message">${escapeHtml(error.message)}</div>
         </div>`;
+        showToast('Connection error: ' + error.message, 'error');
         updatePaginationControls();
     }
 }
@@ -742,27 +779,29 @@ async function downloadFromUrl(url) {
         }
     });
     
-    switchTab('active');
-    
     try {
         const response = await fetch('/api/download-from-url', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ 
+            body: JSON.stringify({
                 url: url,
                 quality: parseInt(quality),
                 ...metadata
             })
         });
-        
+
         const data = await response.json();
-        
-        if (!response.ok) {
-            alert('Failed to start download: ' + (data.error || 'Unknown error'));
+
+        if (response.ok) {
+            // Confirm acceptance via toast and leave the user on Search; they
+            // choose when to switch to the Active tab.
+            showToast('Queued', 'success');
+        } else {
+            showToast('Failed to start download: ' + (data.error || 'Unknown error'), 'error');
         }
-        
+
     } catch (error) {
-        alert('Error: ' + error.message);
+        showToast('Error: ' + error.message, 'error');
     }
 }
 
