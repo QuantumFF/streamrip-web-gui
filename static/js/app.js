@@ -405,7 +405,7 @@ function switchTab(tab, element) {
     } else if (tab === 'config') {
         loadConfig();
     } else if (tab === 'files') {
-        loadFiles();
+        loadLibrary();
     }
 }
 
@@ -477,29 +477,105 @@ async function saveConfig() {
     }
 }
 
-async function loadFiles() {
+// The Library view: an Artist -> Album -> Track tree over the albums on disk.
+// The album list comes back instantly (no tags read server-side); a given
+// album's tracks are fetched lazily the first time it is expanded. Read-only:
+// a folder on disk carries no source URL, so there is no Redownload here.
+async function loadLibrary() {
+    const container = document.getElementById('libraryTree');
+    container.innerHTML = '<div class="empty-state">LOADING LIBRARY...</div>';
     try {
-        const response = await fetch('/api/browse');
-        const files = await response.json();
-        
-        const container = document.getElementById('fileList');
-        
-        if (files.length === 0) {
-            container.innerHTML = '<div class="empty-state">NO FILES FOUND</div>';
+        const response = await fetch('/api/library');
+        const data = await response.json();
+
+        if (!response.ok) {
+            throw new Error(data.error || 'Failed to load library');
+        }
+
+        const albums = data.albums || [];
+        if (albums.length === 0) {
+            container.innerHTML = '<div class="empty-state">NO ALBUMS FOUND</div>';
             return;
         }
-        
-        container.innerHTML = files.map(file => `
-            <div class="file-item">
-                <div class="file-name">${file.name}</div>
-                <div class="file-meta">
-                    ${(file.size / 1024 / 1024).toFixed(2)} MB • 
-                    ${new Date(file.modified * 1000).toLocaleDateString()}
-                </div>
+
+        // Group albums under their artist to build the Artist -> Album tree.
+        const byArtist = new Map();
+        albums.forEach(album => {
+            if (!byArtist.has(album.artist)) {
+                byArtist.set(album.artist, []);
+            }
+            byArtist.get(album.artist).push(album);
+        });
+
+        container.innerHTML = Array.from(byArtist.entries()).map(([artist, artistAlbums]) => `
+            <div class="library-artist">
+                <div class="library-artist-name">${escapeHtml(artist)}</div>
+                ${artistAlbums.map(album => `
+                    <div class="library-album" data-path="${escapeHtml(album.path)}">
+                        <button class="library-album-header" onclick="toggleAlbum(this)">
+                            <span class="library-album-caret">▸</span>
+                            <span class="library-album-name">${escapeHtml(album.album)}</span>
+                        </button>
+                        <div class="library-tracks"></div>
+                    </div>
+                `).join('')}
             </div>
         `).join('');
     } catch (error) {
-        showToast('Failed to load files: ' + error.message, 'error');
+        container.innerHTML = '<div class="empty-state">FAILED TO LOAD LIBRARY</div>';
+        showToast('Failed to load library: ' + error.message, 'error');
+    }
+}
+
+async function toggleAlbum(button) {
+    const albumEl = button.closest('.library-album');
+    const tracksEl = albumEl.querySelector('.library-tracks');
+    const caret = button.querySelector('.library-album-caret');
+
+    // Collapse if already expanded.
+    if (albumEl.classList.contains('expanded')) {
+        albumEl.classList.remove('expanded');
+        caret.textContent = '▸';
+        return;
+    }
+
+    albumEl.classList.add('expanded');
+    caret.textContent = '▾';
+
+    // Lazily fetch this album's tracks only the first time it is expanded.
+    if (albumEl.dataset.loaded === 'true') {
+        return;
+    }
+
+    const path = albumEl.dataset.path;
+    tracksEl.innerHTML = '<div class="library-tracks-loading">LOADING TRACKS...</div>';
+
+    try {
+        const response = await fetch('/api/library/album?path=' + encodeURIComponent(path));
+        const data = await response.json();
+
+        if (!response.ok) {
+            throw new Error(data.error || 'Failed to load tracks');
+        }
+
+        const tracks = data.tracks || [];
+        if (tracks.length === 0) {
+            tracksEl.innerHTML = '<div class="library-tracks-empty">NO TRACKS</div>';
+        } else {
+            tracksEl.innerHTML = tracks.map(track => {
+                const num = track.tracknumber != null ? String(track.tracknumber).padStart(2, '0') : '--';
+                return `
+                    <div class="library-track">
+                        <span class="library-track-number">${escapeHtml(num)}</span>
+                        <span class="library-track-title">${escapeHtml(track.title || '')}</span>
+                    </div>
+                `;
+            }).join('');
+        }
+        albumEl.dataset.loaded = 'true';
+    } catch (error) {
+        tracksEl.innerHTML = '<div class="library-tracks-empty">FAILED TO LOAD TRACKS</div>';
+        showToast('Failed to load tracks: ' + error.message, 'error');
     }
 }
 

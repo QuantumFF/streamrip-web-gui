@@ -52,6 +52,133 @@ MAX_HISTORY = 50
 #track is recorded in its own database. Skip detection keys on this line.
 SKIP_LINE_RE = re.compile(r'Marked as downloaded in the database')
 
+#The audio file extensions streamrip writes. Used to tell tracks apart from the
+#non-audio files (cover art, logs) that share an album folder, so the Library
+#never lists cover.jpg as a track.
+AUDIO_EXTENSIONS = ('.mp3', '.flac', '.m4a', '.opus', '.ogg', '.wav', '.aac', '.alac')
+
+
+def _default_tag_reader(filepath):
+    """Read embedded tags from one audio file with mutagen, returning the raw
+    tracknumber/title (and the disc/total fields a later completeness slice
+    needs). This is the seam tests replace with a fake so the Library tests
+    never touch real files or require mutagen.
+
+    streamrip writes these tags into every file (ADR-0003); mutagen reads them
+    back. Returns {} when the file has no readable tags."""
+    from mutagen import File as MutagenFile
+
+    audio = MutagenFile(filepath, easy=True)
+    if audio is None or audio.tags is None:
+        return {}
+
+    def first(key):
+        value = audio.tags.get(key)
+        if isinstance(value, list):
+            return value[0] if value else None
+        return value
+
+    return {
+        'title': first('title'),
+        'tracknumber': first('tracknumber'),
+        'discnumber': first('discnumber'),
+        'tracktotal': first('tracktotal'),
+        'disctotal': first('disctotal'),
+    }
+
+
+#Injectable tag-reading boundary (mirrors run_rip). Tests swap this for a fake
+#that returns canned tags so the Library suite needs neither mutagen nor real
+#audio files; production reads tags off disk with mutagen.
+read_audio_tags = _default_tag_reader
+
+
+def _is_audio_file(filename):
+    return filename.lower().endswith(AUDIO_EXTENSIONS)
+
+
+def _parse_track_number(raw):
+    """Coerce a tag tracknumber/discnumber into an int. Tags are often stored as
+    "7" or "7/12"; we take the leading integer and ignore anything unparseable."""
+    if raw is None:
+        return None
+    match = re.match(r'\s*(\d+)', str(raw))
+    return int(match.group(1)) if match else None
+
+
+def list_library_albums(download_dir):
+    """List the album folders in the Library (the albums on disk, ADR/Library
+    glossary) without reading a single tag, so it stays instant on large
+    libraries. An album folder is any directory that directly contains at least
+    one audio file; its parent directory name is taken as the Artist.
+
+    Returns a list of {artist, album, path} sorted by artist then album, where
+    ``path`` is the album folder relative to ``download_dir`` (the handle the
+    per-album endpoint expands)."""
+    albums = []
+    if not os.path.isdir(download_dir):
+        return albums
+
+    for root, dirs, filenames in os.walk(download_dir):
+        dirs.sort()
+        if any(_is_audio_file(name) for name in filenames):
+            rel_path = os.path.relpath(root, download_dir)
+            album_name = os.path.basename(root)
+            parent = os.path.dirname(rel_path)
+            artist = os.path.basename(parent) if parent and parent != '.' else 'Unknown Artist'
+            albums.append({
+                'artist': artist,
+                'album': album_name,
+                'path': rel_path,
+            })
+
+    albums.sort(key=lambda a: (a['artist'].lower(), a['album'].lower()))
+    return albums
+
+
+def read_album_tracks(download_dir, rel_path):
+    """Read one album folder's present tracks, lazily — called only when the user
+    expands an album. Each audio file's title and track number come from its
+    embedded tags (ADR-0003) via the read_audio_tags seam; non-audio files (cover
+    art, etc.) are skipped so they are never listed as tracks.
+
+    Returns a list of {tracknumber, discnumber, title, filename} sorted by
+    (disc, track). A file whose tags are unreadable still appears (its title
+    falls back to the filename) so present tracks are never hidden."""
+    album_dir = os.path.join(download_dir, rel_path)
+    tracks = []
+    if not os.path.isdir(album_dir):
+        return tracks
+
+    for filename in os.listdir(album_dir):
+        if not _is_audio_file(filename):
+            continue
+        filepath = os.path.join(album_dir, filename)
+        if not os.path.isfile(filepath):
+            continue
+        try:
+            tags = read_audio_tags(filepath) or {}
+        except Exception as e:
+            logger.warning(f"Failed to read tags from {filepath}: {e}")
+            tags = {}
+
+        tracknumber = _parse_track_number(tags.get('tracknumber'))
+        discnumber = _parse_track_number(tags.get('discnumber'))
+        title = tags.get('title') or filename
+        tracks.append({
+            'tracknumber': tracknumber,
+            'discnumber': discnumber,
+            'title': title,
+            'filename': filename,
+        })
+
+    tracks.sort(key=lambda t: (
+        t['discnumber'] if t['discnumber'] is not None else 0,
+        t['tracknumber'] if t['tracknumber'] is not None else 0,
+        t['filename'].lower(),
+    ))
+    return tracks
+
 
 def build_rip_command(url, quality, *, config_path=None, download_dir=None, no_db=False):
     """Construct the `rip url` argv. Pure (no side effects) so it can be tested
@@ -711,8 +838,52 @@ def browse_downloads():
                     })
         
         files.sort(key=lambda x: x['modified'], reverse=True)
-        return jsonify(files[:100])  
+        return jsonify(files[:100])
     except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/library')
+def library_albums():
+    """List the Library's album folders (Artist -> Album) for the Files tab tree.
+
+    Cheap directory walk only — no tags are read here, so it returns instantly
+    even on large libraries (the per-track tags are fetched lazily per album by
+    /api/library/album). The Library is read-only (ADR-0003): a folder on disk
+    carries no source URL, so there is no Redownload here."""
+    try:
+        return jsonify({'albums': list_library_albums(DOWNLOAD_DIR)})
+    except Exception as e:
+        logger.exception("Failed to list Library albums")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/library/album')
+def library_album_tracks():
+    """Lazily read one album folder's present tracks, with titles and track
+    numbers from embedded tags (ADR-0003). Called when the user expands an album
+    in the tree.
+
+    The ``path`` query parameter is the album's path relative to DOWNLOAD_DIR, as
+    returned by /api/library; it is confined to DOWNLOAD_DIR so the endpoint
+    cannot be used to read tags from arbitrary places on disk."""
+    rel_path = request.args.get('path')
+    if not rel_path:
+        return jsonify({'error': 'path is required'}), 400
+
+    #Confine the resolved album folder to DOWNLOAD_DIR (reject traversal).
+    base = os.path.realpath(DOWNLOAD_DIR)
+    target = os.path.realpath(os.path.join(base, rel_path))
+    if target != base and not target.startswith(base + os.sep):
+        return jsonify({'error': 'invalid path'}), 400
+    if not os.path.isdir(target):
+        return jsonify({'error': 'album not found'}), 404
+
+    try:
+        tracks = read_album_tracks(DOWNLOAD_DIR, rel_path)
+        return jsonify({'path': rel_path, 'tracks': tracks})
+    except Exception as e:
+        logger.exception(f"Failed to read album tracks for {rel_path}")
         return jsonify({'error': str(e)}), 500
 
 
