@@ -178,6 +178,149 @@ def test_album_tracks_unknown_path_is_404(client, library):
     assert resp.status_code == 404
 
 
+def test_album_endpoint_reports_complete(client, library, monkeypatch):
+    rel = os.path.relpath(
+        _make_album(library, 'Artist', 'Album', ['a.flac', 'b.flac']),
+        library,
+    )
+    tags = {
+        'a.flac': {'title': 'One', 'tracknumber': '1', 'tracktotal': '2'},
+        'b.flac': {'title': 'Two', 'tracknumber': '2', 'tracktotal': '2'},
+    }
+    monkeypatch.setattr(app_module, 'read_audio_tags',
+                        lambda fp: tags[os.path.basename(fp)])
+
+    data = _tracks(client, rel).get_json()
+    assert data['completeness']['status'] == 'complete'
+    assert data['completeness']['missing_count'] == 0
+    # No gap rows: every row is a present track.
+    assert all(t['missing'] is False for t in data['tracks'])
+
+
+def test_album_endpoint_reports_incomplete_with_gap_rows(client, library, monkeypatch):
+    # Track 2 of 3 missing on disk -> INCOMPLETE (1 missing), with a greyed gap
+    # row at sequence position 2.
+    rel = os.path.relpath(
+        _make_album(library, 'Artist', 'Album', ['t1.flac', 't3.flac']),
+        library,
+    )
+    tags = {
+        't1.flac': {'title': 'One', 'tracknumber': '1', 'tracktotal': '3'},
+        't3.flac': {'title': 'Three', 'tracknumber': '3', 'tracktotal': '3'},
+    }
+    monkeypatch.setattr(app_module, 'read_audio_tags',
+                        lambda fp: tags[os.path.basename(fp)])
+
+    data = _tracks(client, rel).get_json()
+    assert data['completeness']['status'] == 'incomplete'
+    assert data['completeness']['missing_count'] == 1
+    rows = data['tracks']
+    assert [t['tracknumber'] for t in rows] == [1, 2, 3]
+    assert rows[1]['missing'] is True
+    assert rows[1]['title'] is None  # a missing track has no title on disk
+
+
+def test_album_endpoint_trailing_gap_rows(client, library, monkeypatch):
+    rel = os.path.relpath(
+        _make_album(library, 'Artist', 'Album', ['t1.flac']),
+        library,
+    )
+    monkeypatch.setattr(app_module, 'read_audio_tags',
+                        lambda fp: {'title': 'One', 'tracknumber': '1', 'tracktotal': '3'})
+
+    rows = _tracks(client, rel).get_json()['tracks']
+    assert [t['tracknumber'] for t in rows] == [1, 2, 3]
+    assert [t['missing'] for t in rows] == [False, True, True]
+
+
+def test_album_endpoint_multi_disc_missing_against_disc(client, library, monkeypatch):
+    rel = os.path.relpath(
+        _make_album(library, 'Artist', 'Album',
+                    ['d1t1.flac', 'd1t2.flac', 'd2t1.flac']),
+        library,
+    )
+    tags = {
+        'd1t1.flac': {'tracknumber': '1', 'discnumber': '1', 'tracktotal': '2', 'disctotal': '2'},
+        'd1t2.flac': {'tracknumber': '2', 'discnumber': '1', 'tracktotal': '2', 'disctotal': '2'},
+        'd2t1.flac': {'tracknumber': '1', 'discnumber': '2', 'tracktotal': '2', 'disctotal': '2'},
+    }
+    monkeypatch.setattr(app_module, 'read_audio_tags',
+                        lambda fp: tags[os.path.basename(fp)])
+
+    data = _tracks(client, rel).get_json()
+    assert data['completeness']['status'] == 'incomplete'
+    # Disc 2 track 2 missing, reported against disc 2.
+    assert data['completeness']['missing'] == [{'disc': 2, 'track': 2}]
+    gap = [t for t in data['tracks'] if t['missing']]
+    assert len(gap) == 1
+    assert gap[0]['discnumber'] == 2 and gap[0]['tracknumber'] == 2
+
+
+def test_album_endpoint_no_tags_is_unknown(client, library, monkeypatch):
+    rel = os.path.relpath(
+        _make_album(library, 'Artist', 'Album', ['x.flac']),
+        library,
+    )
+    monkeypatch.setattr(app_module, 'read_audio_tags', lambda fp: {})
+
+    data = _tracks(client, rel).get_json()
+    assert data['completeness']['status'] == 'unknown'
+    # No total known -> no gap rows are invented.
+    assert all(t['missing'] is False for t in data['tracks'])
+
+
+def test_assessment_cached_on_folder_mtime(client, library, monkeypatch):
+    # Re-expanding an unchanged album must not re-read tags: the per-album
+    # assessment is cached keyed on the folder mtime (ADR-0003).
+    rel = os.path.relpath(
+        _make_album(library, 'Artist', 'Album', ['a.flac', 'b.flac']),
+        library,
+    )
+    app_module.album_assessment_cache.clear()
+
+    calls = {'n': 0}
+
+    def counting_reader(fp):
+        calls['n'] += 1
+        return {'title': 'T', 'tracknumber': '1', 'tracktotal': '2'}
+
+    monkeypatch.setattr(app_module, 'read_audio_tags', counting_reader)
+
+    _tracks(client, rel)
+    first = calls['n']
+    assert first > 0
+
+    # Second request on the unchanged folder: served from cache, no new reads.
+    _tracks(client, rel)
+    assert calls['n'] == first
+
+
+def test_assessment_cache_invalidated_when_folder_changes(client, library, monkeypatch):
+    # Deleting/adding a track changes the folder mtime, which must invalidate the
+    # cached assessment so completeness reflects the new contents.
+    album_dir = _make_album(library, 'Artist', 'Album', ['a.flac', 'b.flac'])
+    rel = os.path.relpath(album_dir, library)
+    app_module.album_assessment_cache.clear()
+
+    tags = {
+        'a.flac': {'title': 'One', 'tracknumber': '1', 'tracktotal': '2'},
+        'b.flac': {'title': 'Two', 'tracknumber': '2', 'tracktotal': '2'},
+    }
+    monkeypatch.setattr(app_module, 'read_audio_tags',
+                        lambda fp: tags[os.path.basename(fp)])
+
+    assert _tracks(client, rel).get_json()['completeness']['status'] == 'complete'
+
+    # Delete track 2 and bump the folder mtime so the cache key changes.
+    os.remove(os.path.join(album_dir, 'b.flac'))
+    future = os.stat(album_dir).st_mtime + 10
+    os.utime(album_dir, (future, future))
+
+    data = _tracks(client, rel).get_json()
+    assert data['completeness']['status'] == 'incomplete'
+    assert data['completeness']['missing'] == [{'disc': 1, 'track': 2}]
+
+
 def test_disc_number_orders_before_track_number(client, library, monkeypatch):
     rel = os.path.relpath(
         _make_album(library, 'Artist', 'Album', ['d2t1.flac', 'd1t2.flac', 'd1t1.flac']),

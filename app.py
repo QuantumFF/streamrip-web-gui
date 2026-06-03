@@ -106,6 +106,80 @@ def _parse_track_number(raw):
     return int(match.group(1)) if match else None
 
 
+def assess_completeness(present_tracks):
+    """Assess an album's Album completeness (ADR-0003 / CONTEXT glossary) purely
+    from the embedded tags of the tracks *present* on disk — no network, no
+    stored tracklist. ``present_tracks`` is a list of plain dicts with raw tag
+    fields ``disc``/``track``/``tracktotal``/``disctotal`` (any may be missing).
+
+    Returns a dict::
+
+        {
+          'status': 'complete' | 'incomplete' | 'unknown',
+          'missing': [{'disc': D, 'track': N}, ...],   # sorted, [] unless incomplete
+          'discs': [
+              {'disc': D, 'tracktotal': T, 'present': [...], 'missing': [...]},
+              ...
+          ],
+        }
+
+    Completeness logic: any present track reveals its disc's true ``tracktotal``,
+    so every gap — interior and trailing — is detectable. Each disc is assessed
+    independently and missing tracks are reported against their own disc. An
+    album with no present track carrying a readable ``tracktotal`` is **Unknown**
+    (never guessed); a track with no readable disc is treated as disc 1."""
+    discs = {}
+    saw_total = False
+
+    for raw in present_tracks:
+        disc = _parse_track_number(raw.get('disc'))
+        track = _parse_track_number(raw.get('track'))
+        tracktotal = _parse_track_number(raw.get('tracktotal'))
+
+        #A track with no readable disc tag belongs to disc 1 (the common
+        #single-disc case where streamrip omits/zeroes the disc number).
+        if disc is None or disc < 1:
+            disc = 1
+
+        entry = discs.setdefault(disc, {'present': set(), 'tracktotal': None})
+        if track is not None and track >= 1:
+            entry['present'].add(track)
+        if tracktotal is not None and tracktotal >= 1:
+            saw_total = True
+            #Keep the largest total seen on this disc; a present track number
+            #beyond it would itself imply a larger album, handled below.
+            if entry['tracktotal'] is None or tracktotal > entry['tracktotal']:
+                entry['tracktotal'] = tracktotal
+
+    if not saw_total:
+        return {'status': 'unknown', 'missing': [], 'discs': []}
+
+    disc_reports = []
+    all_missing = []
+    for disc in sorted(discs):
+        entry = discs[disc]
+        present = sorted(entry['present'])
+        total = entry['tracktotal']
+        #If a present track number exceeds the tagged total (or no total on this
+        #disc but present numbers exist), trust the highest present number so we
+        #never report a present track as missing.
+        highest_present = present[-1] if present else 0
+        if total is None or highest_present > total:
+            total = highest_present
+        missing = [n for n in range(1, total + 1) if n not in entry['present']]
+        disc_reports.append({
+            'disc': disc,
+            'tracktotal': total,
+            'present': present,
+            'missing': missing,
+        })
+        all_missing.extend({'disc': disc, 'track': n} for n in missing)
+
+    all_missing.sort(key=lambda m: (m['disc'], m['track']))
+    status = 'complete' if not all_missing else 'incomplete'
+    return {'status': status, 'missing': all_missing, 'discs': disc_reports}
+
+
 def list_library_albums(download_dir):
     """List the album folders in the Library (the albums on disk, ADR/Library
     glossary) without reading a single tag, so it stays instant on large
@@ -170,6 +244,10 @@ def read_album_tracks(download_dir, rel_path):
             'discnumber': discnumber,
             'title': title,
             'filename': filename,
+            #Carry the raw totals through so completeness can be assessed from
+            #the same tag read (ADR-0003) without a second pass over the files.
+            'tracktotal': _parse_track_number(tags.get('tracktotal')),
+            'disctotal': _parse_track_number(tags.get('disctotal')),
         })
 
     tracks.sort(key=lambda t: (
@@ -178,6 +256,94 @@ def read_album_tracks(download_dir, rel_path):
         t['filename'].lower(),
     ))
     return tracks
+
+
+#Per-album completeness assessment cache, keyed on the album folder path and its
+#mtime (ADR-0003: completeness comes from the tags on disk). Re-expanding an
+#unchanged album returns the cached payload without re-reading any tags;
+#downloading/deleting a track changes the folder mtime and invalidates it.
+album_assessment_cache = {}
+album_cache_lock = threading.Lock()
+
+
+def _album_folder_mtime(album_dir):
+    """The album folder's own mtime — bumped by the filesystem whenever a track
+    file is added to or removed from the directory, which is exactly the events
+    that can change completeness. Returns None when the folder is missing."""
+    try:
+        return os.stat(album_dir).st_mtime
+    except OSError:
+        return None
+
+
+def _build_track_rows(present_tracks, assessment):
+    """Merge the present tracks with greyed "missing" gap rows so the expanded
+    album renders the full expected sequence 1…tracktotal per disc, with absent
+    tracks shown in sequence position (interior and trailing). A missing track is
+    shown by number only — it left no title on disk (ADR-0003)."""
+    rows = list(present_tracks)
+    for miss in assessment.get('missing', []):
+        rows.append({
+            'tracknumber': miss['track'],
+            'discnumber': miss['disc'],
+            'title': None,
+            'filename': None,
+            'tracktotal': None,
+            'disctotal': None,
+            'missing': True,
+        })
+    #Sort present and missing rows into one expected sequence. A present track
+    #with no disc tag belongs to disc 1, exactly as assess_completeness assigns
+    #its gap rows, so the two interleave correctly (no disc tag -> disc 1).
+    rows.sort(key=lambda t: (
+        t['discnumber'] if t['discnumber'] is not None and t['discnumber'] >= 1 else 1,
+        t['tracknumber'] if t['tracknumber'] is not None else 0,
+        (t.get('filename') or '').lower(),
+    ))
+    for row in rows:
+        row.setdefault('missing', False)
+    return rows
+
+
+def get_album_assessment(download_dir, rel_path):
+    """Read one album's present tracks, assess its Album completeness, and return
+    the payload the per-album endpoint serves: the full track sequence (present
+    tracks plus greyed missing gap rows) and the completeness badge data.
+
+    Cached per album keyed on the folder's mtime (ADR-0003): re-expanding an
+    unchanged album returns the cached result and does not re-read a single tag."""
+    album_dir = os.path.join(download_dir, rel_path)
+    mtime = _album_folder_mtime(album_dir)
+
+    cache_key = os.path.realpath(album_dir)
+    with album_cache_lock:
+        cached = album_assessment_cache.get(cache_key)
+        if cached is not None and cached['mtime'] == mtime and mtime is not None:
+            return cached['payload']
+
+    present_tracks = read_album_tracks(download_dir, rel_path)
+    assessment = assess_completeness([
+        {
+            'disc': t['discnumber'],
+            'track': t['tracknumber'],
+            'tracktotal': t['tracktotal'],
+            'disctotal': t['disctotal'],
+        }
+        for t in present_tracks
+    ])
+    payload = {
+        'tracks': _build_track_rows(present_tracks, assessment),
+        'completeness': {
+            'status': assessment['status'],
+            'missing_count': len(assessment['missing']),
+            'missing': assessment['missing'],
+        },
+    }
+
+    if mtime is not None:
+        with album_cache_lock:
+            album_assessment_cache[cache_key] = {'mtime': mtime, 'payload': payload}
+    return payload
 
 
 def build_rip_command(url, quality, *, config_path=None, download_dir=None, no_db=False):
@@ -880,8 +1046,12 @@ def library_album_tracks():
         return jsonify({'error': 'album not found'}), 404
 
     try:
-        tracks = read_album_tracks(DOWNLOAD_DIR, rel_path)
-        return jsonify({'path': rel_path, 'tracks': tracks})
+        payload = get_album_assessment(DOWNLOAD_DIR, rel_path)
+        return jsonify({
+            'path': rel_path,
+            'tracks': payload['tracks'],
+            'completeness': payload['completeness'],
+        })
     except Exception as e:
         logger.exception(f"Failed to read album tracks for {rel_path}")
         return jsonify({'error': str(e)}), 500

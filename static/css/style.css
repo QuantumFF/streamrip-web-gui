@@ -535,6 +535,39 @@ button:disabled {
     word-break: break-word;
 }
 
+/* Album completeness badge (ADR-0003): COMPLETE / INCOMPLETE (n missing) /
+   UNKNOWN. Derived entirely from embedded tags of present tracks. */
+.library-album-badge {
+    flex-shrink: 0;
+    font-size: 10px;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    padding: 2px 8px;
+    border: 1px solid var(--border);
+    border-radius: 2px;
+    white-space: nowrap;
+}
+
+.library-album-badge.badge-pending {
+    color: var(--text-tertiary);
+    border-color: var(--border);
+}
+
+.library-album-badge.badge-complete {
+    color: var(--success);
+    border-color: var(--success);
+}
+
+.library-album-badge.badge-incomplete {
+    color: var(--warning);
+    border-color: var(--warning);
+}
+
+.library-album-badge.badge-unknown {
+    color: var(--text-tertiary);
+    border-color: var(--text-tertiary);
+}
+
 .library-tracks {
     display: none;
     padding-left: 20px;
@@ -558,6 +591,14 @@ button:disabled {
 .library-track-number {
     color: var(--text-tertiary);
     flex-shrink: 0;
+}
+
+/* A missing track (never downloaded, no tags on disk): greyed, number-only,
+   rendered in its sequence position so interior and trailing gaps are visible. */
+.library-track-missing {
+    color: var(--text-tertiary);
+    font-style: italic;
+    opacity: 0.7;
 }
 
 .library-track-title {

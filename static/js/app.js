@@ -515,15 +515,57 @@ async function loadLibrary() {
                         <button class="library-album-header" onclick="toggleAlbum(this)">
                             <span class="library-album-caret">▸</span>
                             <span class="library-album-name">${escapeHtml(album.album)}</span>
+                            <span class="library-album-badge badge-pending" data-role="badge">…</span>
                         </button>
                         <div class="library-tracks"></div>
                     </div>
                 `).join('')}
             </div>
         `).join('');
+
+        // Every album carries a completeness badge (ADR-0003). The badge is
+        // derived from embedded tags, so it is filled lazily per album from the
+        // per-album endpoint (cached server-side on folder mtime) without
+        // blocking the instant, tag-free album listing above.
+        document.querySelectorAll('#libraryTree .library-album').forEach(loadAlbumBadge);
     } catch (error) {
         container.innerHTML = '<div class="empty-state">FAILED TO LOAD LIBRARY</div>';
         showToast('Failed to load library: ' + error.message, 'error');
+    }
+}
+
+// Render a completeness badge into an album's header: COMPLETE / INCOMPLETE
+// (n missing) / UNKNOWN. Caches the fetched album payload on the element so
+// expanding it later reuses it without a second request.
+function applyCompletenessBadge(albumEl, completeness) {
+    const badge = albumEl.querySelector('[data-role="badge"]');
+    if (!badge) return;
+    const status = completeness ? completeness.status : 'unknown';
+    badge.classList.remove('badge-pending', 'badge-complete', 'badge-incomplete', 'badge-unknown');
+    if (status === 'complete') {
+        badge.classList.add('badge-complete');
+        badge.textContent = 'COMPLETE';
+    } else if (status === 'incomplete') {
+        const n = completeness.missing_count || 0;
+        badge.classList.add('badge-incomplete');
+        badge.textContent = `INCOMPLETE (${n} missing)`;
+    } else {
+        badge.classList.add('badge-unknown');
+        badge.textContent = 'UNKNOWN';
+    }
+}
+
+async function loadAlbumBadge(albumEl) {
+    const path = albumEl.dataset.path;
+    try {
+        const response = await fetch('/api/library/album?path=' + encodeURIComponent(path));
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Failed');
+        // Stash the payload so toggleAlbum reuses it (server already cached it).
+        albumEl._albumData = data;
+        applyCompletenessBadge(albumEl, data.completeness);
+    } catch (error) {
+        applyCompletenessBadge(albumEl, { status: 'unknown' });
     }
 }
 
@@ -551,19 +593,35 @@ async function toggleAlbum(button) {
     tracksEl.innerHTML = '<div class="library-tracks-loading">LOADING TRACKS...</div>';
 
     try {
-        const response = await fetch('/api/library/album?path=' + encodeURIComponent(path));
-        const data = await response.json();
-
-        if (!response.ok) {
-            throw new Error(data.error || 'Failed to load tracks');
+        // Reuse the payload the badge already fetched (the server caches it on
+        // folder mtime, so this would hit that cache anyway).
+        let data = albumEl._albumData;
+        if (!data) {
+            const response = await fetch('/api/library/album?path=' + encodeURIComponent(path));
+            data = await response.json();
+            if (!response.ok) {
+                throw new Error(data.error || 'Failed to load tracks');
+            }
+            albumEl._albumData = data;
         }
+        applyCompletenessBadge(albumEl, data.completeness);
 
         const tracks = data.tracks || [];
         if (tracks.length === 0) {
             tracksEl.innerHTML = '<div class="library-tracks-empty">NO TRACKS</div>';
         } else {
+            // The expected sequence 1…tracktotal per disc, with absent tracks as
+            // greyed, number-only "Track N — missing" rows (ADR-0003).
             tracksEl.innerHTML = tracks.map(track => {
                 const num = track.tracknumber != null ? String(track.tracknumber).padStart(2, '0') : '--';
+                if (track.missing) {
+                    return `
+                        <div class="library-track library-track-missing">
+                            <span class="library-track-number">${escapeHtml(num)}</span>
+                            <span class="library-track-title">Track ${escapeHtml(String(track.tracknumber))} — missing</span>
+                        </div>
+                    `;
+                }
                 return `
                     <div class="library-track">
                         <span class="library-track-number">${escapeHtml(num)}</span>
