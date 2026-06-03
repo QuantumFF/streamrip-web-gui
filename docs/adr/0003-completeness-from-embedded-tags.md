@@ -1,0 +1,28 @@
+# Album completeness is derived from embedded tags, not a stored tracklist
+
+The Library/Files view verifies whether an album on disk is complete by reading
+the embedded tags (`tracktotal`, `disctotal`, `tracknumber`, `discnumber`) of
+the tracks that are present, and comparing the present track numbers against the
+expected `1…tracktotal` per disc. streamrip writes these tags into every file
+(`metadata/tagger.py`), and mutagen — already a streamrip dependency — reads
+them back.
+
+## Considered Options
+
+- **Store the expected tracklist per download** (or re-fetch it from the source
+  on demand). Requires persisting metadata keyed to each folder, or a network
+  round-trip and the source URL/ID — which a bare folder on disk does not carry.
+- **Infer gaps from track-number sequence alone.** Cannot detect trailing gaps
+  (e.g. tracks 10–12 missing) because the true total is unknown.
+- **Read totals from present tags (chosen).** Any single present track reveals
+  the album's true `tracktotal`, so all gaps — including trailing ones — are
+  detectable from disk alone, with no network, no stored metadata, and no DB.
+
+## Consequences
+
+A missing track can only be shown by number ("Track 7 — missing"), never by
+title, because a track that was never downloaded left no tags on disk. An album
+with zero readable-tag tracks is reported as **Unknown** rather than guessed.
+The Library view is read-only: it cannot offer Redownload, because a folder on
+disk carries no source URL (Redownload lives in History — see the Redownload
+glossary entry).
