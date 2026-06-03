@@ -37,117 +37,230 @@ except OSError as e:
     logger.error("=" * 60)
 
 download_queue = queue.Queue()
+#Server is the source of truth (ADR-0002): Active + History live here in memory.
+#active_downloads maps task_id -> Download record (status: queued | downloading).
 active_downloads = {}
+active_lock = threading.Lock()
 download_history = []
+history_lock = threading.Lock()
 sse_clients = []
 album_art_cache = {}
 cache_lock = threading.Lock()
-         
+MAX_HISTORY = 50
+
+#The exact line streamrip logs once per track it refuses to re-download because the
+#track is recorded in its own database. Skip detection keys on this line.
+SKIP_LINE_RE = re.compile(r'Marked as downloaded in the database')
+
+
+def build_rip_command(url, quality, *, config_path=None, download_dir=None, no_db=False):
+    """Construct the `rip url` argv. Pure (no side effects) so it can be tested
+    directly and reused for Redownload (no_db -> --no-db). This is the single
+    place the download invocation is assembled."""
+    cmd = ['rip']
+    if config_path and os.path.exists(config_path):
+        cmd.extend(['--config-path', config_path])
+    if no_db:
+        cmd.append('--no-db')
+    if download_dir:
+        cmd.extend(['-f', download_dir])
+    cmd.extend(['-q', str(quality)])
+    cmd.extend(['url', url])
+    return cmd
+
+
+def classify_download(returncode, output):
+    """Map a finished `rip` run to a terminal Download state from its exit code
+    and stdout. Pure, so the worker's terminal-state logic is unit-testable."""
+    if returncode != 0:
+        return 'failed'
+    #Skipped: rip did no downloading work because every track was already
+    #recorded in its database. Keyed on the skip log line; only a skip when
+    #nothing was actually downloaded.
+    if SKIP_LINE_RE.search(output) and '─ Downloading' not in output:
+        return 'skipped'
+    return 'completed'
+
+
+def _default_runner(cmd):
+    """Run `rip` as a subprocess (ADR-0001), yielding stripped stdout lines and
+    finally returning the exit code. This is the seam tests replace with a fake
+    so no test ever launches a real `rip` process."""
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding='utf-8',
+        errors='replace',
+        bufsize=1,
+    )
+    try:
+        for line in process.stdout:
+            line = line.strip()
+            if line:
+                yield line
+        process.wait()
+    finally:
+        if process.poll() is None:
+            process.terminate()
+    return process.returncode
+
+
+#Injectable subprocess boundary. Tests swap this for a fake generator that emits
+#canned output and a return code; production uses the real `rip` runner.
+run_rip = _default_runner
+
+
+def register_queued(task):
+    """Register a submitted Download in server Active state as `queued` and
+    announce it immediately, before any worker is free. Guarantees a submitted
+    Download is visible the instant the server accepts it."""
+    record = {
+        'id': task['id'],
+        'url': task['url'],
+        'quality': task.get('quality', 3),
+        'metadata': task.get('metadata', {}),
+        'status': 'queued',
+        'queued_at': time.time(),
+    }
+    with active_lock:
+        active_downloads[task['id']] = record
+    broadcast_sse({
+        'type': 'download_queued',
+        'id': record['id'],
+        'metadata': record['metadata'],
+        'status': 'queued',
+    })
+
+
+def enqueue_download(url, quality=3, metadata=None):
+    """Create a Download, register it as Queued (visible immediately), and hand
+    it to a worker. Returns the task id."""
+    task_id = f"dl_{int(time.time() * 1000)}_{len(active_downloads)}"
+    task = {
+        'id': task_id,
+        'url': url,
+        'quality': quality,
+        'metadata': metadata or {},
+    }
+    register_queued(task)
+    download_queue.put(task)
+    return task_id
+
+
 class DownloadWorker(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True)
         self.current_process = None
-        
+
     def run(self):
         while True:
             task = download_queue.get()
             if task is None:
                 break
-                
+
             task_id = task['id']
             url = task['url']
             quality = task.get('quality', 3)
             metadata = task.get('metadata', {})
-            
-            active_downloads[task_id] = {
-                'status': 'downloading',
-                'url': url,
-                'metadata': metadata,
-                'started': time.time()
-            }
-            
+            no_db = task.get('no_db', False)
+
+            #Transition the existing Queued card in place to Downloading.
+            with active_lock:
+                record = active_downloads.get(task_id)
+                if record is not None:
+                    record['status'] = 'downloading'
+                    record['started'] = time.time()
+
             broadcast_sse({
                 'type': 'download_started',
                 'id': task_id,
                 'metadata': metadata,
                 'status': 'downloading'
             })
-            
-            output_lines = []
-            process = None 
-            
-            try:
-                cmd = ['rip']
-                if os.path.exists(STREAMRIP_CONFIG):
-                    cmd.extend(['--config-path', STREAMRIP_CONFIG])
-                cmd.extend(['-f', DOWNLOAD_DIR])
-                cmd.extend(['-q', str(quality)])
-                cmd.extend(['url', url])
 
-                process = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    encoding='utf-8',
-                    errors='replace',
-                    bufsize=1,
-                )
-                
-                self.current_process = process
-                
-                for line in process.stdout:
-                    line = line.strip()
-                    if line:
-                        output_lines.append(line)
-                        if len(output_lines) % 10 == 0:  
-                            broadcast_sse({
-                                'type': 'download_progress',
-                                'id': task_id,
-                                'output': "\n".join(output_lines[-5:]),
-                                'progress': {'raw_output': True}
-                            })
-                
-                process.wait()
+            output_lines = []
+            cmd = build_rip_command(
+                url, quality,
+                config_path=STREAMRIP_CONFIG,
+                download_dir=DOWNLOAD_DIR,
+                no_db=no_db,
+            )
+
+            try:
+                runner = run_rip(cmd)
+                returncode = 0
+                try:
+                    while True:
+                        line = next(runner)
+                        if line:
+                            output_lines.append(line)
+                            if len(output_lines) % 10 == 0:
+                                broadcast_sse({
+                                    'type': 'download_progress',
+                                    'id': task_id,
+                                    'output': "\n".join(output_lines[-5:]),
+                                    'progress': {'raw_output': True}
+                                })
+                except StopIteration as stop:
+                    returncode = stop.value if stop.value is not None else 0
 
                 full_output = "\n".join(output_lines)
+                status = classify_download(returncode, full_output)
 
-                if process.returncode != 0:
-                    status = 'failed'
-                    logger.error(f"Download failed (exit code {process.returncode}): {' '.join(cmd)}")
+                if status == 'failed':
+                    logger.error(f"Download failed (exit code {returncode}): {' '.join(cmd)}")
                     logger.error("rip output (last 30 lines):\n%s", "\n".join(output_lines[-30:]))
-                elif re.search(r'Skipping track \d+', full_output) and '─ Downloading' not in full_output:
-                    #rip skipped every track (already in its database) and only fetched cover art
-                    status = 'skipped'
+                elif status == 'skipped':
                     logger.info(f"Already downloaded (marked in streamrip database): {url}")
-                else:
-                    status = 'completed'
 
-                broadcast_sse({
-                    'type': 'download_completed',
-                    'id': task_id,
-                    'status': status,
-                    'metadata': metadata,
-                    'output': full_output
-                })
-                            
+                finalize_download(task_id, status, metadata, full_output)
+
             except Exception as e:
                 logger.exception(f"Download worker error for {url}")
-                broadcast_sse({
-                    'type': 'download_error',
-                    'id': task_id,
-                    'error': str(e),
-                    'output': "\n".join(output_lines) if output_lines else str(e)
-                })
-            
+                finalize_download(
+                    task_id, 'failed', metadata,
+                    "\n".join(output_lines) if output_lines else str(e),
+                    error=str(e),
+                )
+
             finally:
                 self.current_process = None
-                if task_id in active_downloads:
-                    del active_downloads[task_id]
-                if process and process.poll() is None:
-                    process.terminate()
-            
+
             download_queue.task_done()
+
+
+def finalize_download(task_id, status, metadata, output, error=None):
+    """Move a Download out of Active into server-owned History with its terminal
+    state, and broadcast the transition. History is appended server-side here so
+    it survives a page refresh (ADR-0002)."""
+    with active_lock:
+        record = active_downloads.pop(task_id, None)
+
+    entry = {
+        'id': task_id,
+        'url': record.get('url') if record else None,
+        'metadata': metadata or (record.get('metadata') if record else {}),
+        'status': status,
+        'output': output,
+        'completed_at': time.time(),
+    }
+    if error:
+        entry['error'] = error
+
+    with history_lock:
+        download_history.insert(0, entry)
+        del download_history[MAX_HISTORY:]
+
+    broadcast_sse({
+        'type': 'download_completed',
+        'id': task_id,
+        'status': status,
+        'metadata': entry['metadata'],
+        'output': output,
+        **({'error': error} if error else {}),
+    })
 
 def broadcast_sse(data):
     message = f"data: {json.dumps(data)}\n\n"
@@ -220,25 +333,23 @@ def start_download():
         return jsonify({'error': 'Unsupported service URL'}), 400
     
     metadata = extract_metadata_from_url(url)
-    
-    task_id = f"dl_{int(time.time() * 1000)}"
-    task = {
-        'id': task_id,
-        'url': url,
-        'quality': quality,
-        'metadata': metadata 
-    }
-    
-    download_queue.put(task)
-    
+
+    task_id = enqueue_download(url, quality, metadata)
+
     return jsonify({'task_id': task_id, 'status': 'queued'})
 
 
 @app.route('/api/status')
 def get_all_status():
+    #Server is the source of truth (ADR-0002). Active is returned as a list so the
+    #frontend can rehydrate the unified Active list (Queued + Downloading) on load.
+    with active_lock:
+        active = list(active_downloads.values())
+    with history_lock:
+        history = list(download_history)
     return jsonify({
-        'active': active_downloads,
-        'history': download_history[-20:],
+        'active': active,
+        'history': history,
         'queue_size': download_queue.qsize()
     })
 
@@ -851,18 +962,10 @@ def download_from_url():
     else:
         metadata = extract_metadata_from_url(url)
     
-    task_id = f"dl_{int(time.time() * 1000)}"
-    task = {
-        'id': task_id,
-        'url': url,
-        'quality': quality,
-        'metadata': metadata
-    }
-    
-    download_queue.put(task)
-    
+    task_id = enqueue_download(url, quality, metadata)
+
     return jsonify({
-        'task_id': task_id, 
+        'task_id': task_id,
         'status': 'queued',
         'metadata': metadata
     })

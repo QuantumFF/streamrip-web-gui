@@ -33,8 +33,11 @@ function initializeSSE() {
 }
 
 function handleSSEMessage(data) {
-    
+
     switch(data.type) {
+        case 'download_queued':
+            handleDownloadQueued(data);
+            break;
         case 'download_started':
             handleDownloadStarted(data);
             break;
@@ -47,24 +50,80 @@ function handleSSEMessage(data) {
         case 'download_error':
             handleDownloadError(data);
             break;
-		case 'heartbeat':
-			console.log('badump')
+        case 'connected':
+        case 'heartbeat':
+            break;
         default:
             console.log('Unknown SSE message type:', data.type);
     }
 }
 
-function handleDownloadStarted(data) {
+// Pull the authoritative Active list + History from the server (ADR-0002) so a
+// page refresh loses nothing. Runs before live SSE deltas are processed.
+async function rehydrateState() {
+    try {
+        const response = await fetch('/api/status');
+        if (!response.ok) return;
+        const data = await response.json();
+
+        activeDownloads.clear();
+        (data.active || []).forEach(item => {
+            activeDownloads.set(item.id, {
+                id: item.id,
+                metadata: item.metadata || {},
+                status: item.status || 'queued',
+                output: ''
+            });
+        });
+
+        downloadHistory = (data.history || []).map(item => ({
+            id: item.id,
+            metadata: item.metadata || {},
+            status: item.status,
+            output: item.output || '',
+            completedAt: item.completed_at ? item.completed_at * 1000 : Date.now()
+        }));
+    } catch (error) {
+        console.error('Failed to rehydrate state:', error);
+    } finally {
+        if (currentTab === 'active') {
+            renderActiveDownloads();
+        } else if (currentTab === 'history') {
+            renderDownloadHistory();
+        }
+    }
+}
+
+function handleDownloadQueued(data) {
+    // A Queued card appears the instant the server accepts a Download, even
+    // when every worker is busy.
     activeDownloads.set(data.id, {
         id: data.id,
-        metadata: data.metadata,
-        status: 'downloading',
-        progress: 0,
-        output: [],
-        startTime: Date.now()
+        metadata: data.metadata || {},
+        status: 'queued',
+        output: '',
+        queuedAt: Date.now()
     });
-    
+
     if (currentTab === 'active') {
+        renderActiveDownloads();
+    }
+}
+
+function handleDownloadStarted(data) {
+    // Transition the existing Queued card in place to Downloading.
+    const download = activeDownloads.get(data.id) || {
+        id: data.id,
+        output: ''
+    };
+    download.metadata = data.metadata || download.metadata || {};
+    download.status = 'downloading';
+    download.startTime = Date.now();
+    activeDownloads.set(data.id, download);
+
+    if (currentTab === 'active') {
+        // Re-render so the card gains its spinner; updateDownloadElement alone
+        // cannot add the spinner that a Queued card lacks.
         renderActiveDownloads();
     }
 }
@@ -146,7 +205,7 @@ function handleDownloadCompleted(data) {
     if (download) {
         download.status = data.status;
         download.endTime = Date.now();
-        download.output = data.output || download.allOutput.join('\n') || 'No output captured';
+        download.output = data.output || (download.allOutput && download.allOutput.join('\n')) || 'No output captured';
         updateDownloadElement(data.id, download);
         
         setTimeout(() => {
@@ -217,7 +276,7 @@ function renderActiveDownloads() {
                     </div>
                     ${item.output ? `<a class="toggle-output" onclick="toggleOutput('${item.id}')">SHOW OUTPUT</a>` : ''}
                 </div>
-                <div class="download-spinner"></div>
+                ${item.status === 'downloading' ? '<div class="download-spinner"></div>' : ''}
             </div>
             ${item.output ? `
                 <div class="download-output">
@@ -655,6 +714,9 @@ async function downloadFromUrl(url) {
 
 
 window.addEventListener('load', () => {
+    // Rehydrate authoritative server state first (ADR-0002), then attach the
+    // live SSE delta channel on top of it.
+    rehydrateState();
     initializeSSE();
 });
 

@@ -185,6 +185,10 @@ button:disabled {
     border-color: var(--text-tertiary);
 }
 
+.download-item.queued {
+    border-left: 3px solid var(--text-tertiary);
+}
+
 .download-item.downloading {
     border-left: 3px solid var(--warning);
 }
