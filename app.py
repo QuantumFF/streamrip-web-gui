@@ -706,6 +706,20 @@ def parse_search_results(content, source, search_type):
     return ParsedSearch(results, None)
 
 
+def _rip_runner_env():
+    """Environment for a spawned `rip`, forcing a wide terminal width.
+
+    streamrip logs through rich's RichHandler, which wraps to the console width;
+    when `rip` runs as a subprocess with a piped (non-tty) stdout that width
+    defaults to 80 columns. At 80 cols the single line skip detection keys on —
+    "...Marked as downloaded in the database." — wraps mid phrase, and rich drops
+    its right-aligned source location into the gap, so SKIP_LINE_RE never matches
+    and an already-downloaded album is misclassified as a fresh completion (its
+    "already downloaded" state is lost). A wide COLUMNS keeps each log line whole;
+    the per-line strip in the runner removes the resulting trailing padding."""
+    return {**os.environ, "COLUMNS": "1000"}
+
+
 def _default_runner(cmd):
     """Run `rip` as a subprocess (ADR-0001), yielding stripped stdout lines and
     finally returning the exit code. This is the seam tests replace with a fake
@@ -718,6 +732,7 @@ def _default_runner(cmd):
         encoding="utf-8",
         errors="replace",
         bufsize=1,
+        env=_rip_runner_env(),
     )
     try:
         for line in process.stdout:
@@ -749,6 +764,7 @@ def _default_search_runner(cmd):
         encoding="utf-8",
         errors="replace",
         timeout=30,
+        env=_rip_runner_env(),
     )
 
 
