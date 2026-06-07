@@ -46,5 +46,12 @@ USER 1000:1000
 # Expose port
 EXPOSE 5000
 
-# Run with aggressive worker recycling
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--worker-class", "gevent", "--workers", "2", "--timeout", "60", "app:app"]
+# Single worker only: Active/History state, the SSE subscriber list, and the
+# download worker threads all live in-process (ADR-0002). A second gunicorn
+# worker is a separate process with its own copy of all three, so the browser's
+# SSE stream and the request that starts a download can land on different
+# workers — the download runs but never shows up in Active/History. The gevent
+# worker class serves many concurrent SSE clients in this one process via
+# greenlets, and download concurrency is handled internally by
+# MAX_CONCURRENT_DOWNLOADS worker threads, so one worker loses nothing.
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--worker-class", "gevent", "--workers", "1", "--timeout", "60", "app:app"]
