@@ -1382,6 +1382,38 @@ def library_album_tracks():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/library/album", methods=["DELETE"])
+def delete_library_album():
+    """Delete one album folder and everything under it from disk.
+
+    The ``path`` query parameter is the album's path relative to DOWNLOAD_DIR, as
+    returned by /api/library; it is confined to DOWNLOAD_DIR (rejecting traversal)
+    so the endpoint can only delete album folders within the Library, never
+    DOWNLOAD_DIR itself nor arbitrary directories on disk."""
+    rel_path = request.args.get("path")
+    if not rel_path:
+        return jsonify({"error": "path is required"}), 400
+
+    # Confine the resolved album folder to DOWNLOAD_DIR (reject traversal) and
+    # refuse to delete DOWNLOAD_DIR itself.
+    base = os.path.realpath(DOWNLOAD_DIR)
+    target = os.path.realpath(os.path.join(base, rel_path))
+    if target == base or not target.startswith(base + os.sep):
+        return jsonify({"error": "invalid path"}), 400
+    if not os.path.isdir(target):
+        return jsonify({"error": "album not found"}), 404
+
+    try:
+        shutil.rmtree(target)
+        # Drop any cached completeness assessment for the now-gone folder.
+        with album_cache_lock:
+            album_assessment_cache.pop(target, None)
+        return jsonify({"success": True})
+    except Exception as e:
+        logger.exception(f"Failed to delete album {rel_path}")
+        return jsonify({"error": str(e)}), 500
+
+
 class Source:
     """A single music source (Qobuz, Tidal, ...), owning everything that source
     specific: how to build a share URL from an id, how to fetch its album art,
