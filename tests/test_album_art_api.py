@@ -69,3 +69,29 @@ def test_album_art_qobuz_caches_result(client, monkeypatch, tmp_path):
     client.get("/api/album-art", query_string=q)
     # Second call served from cache -> seam hit exactly once.
     assert len(calls) == 1
+
+
+def test_album_art_deezer_album_uses_template_no_network(client, monkeypatch):
+    app_module.album_art_cache.clear()
+    calls = _stub_http_get(monkeypatch, {})
+    resp = client.get(
+        "/api/album-art",
+        query_string={"source": "deezer", "type": "album", "id": "111"},
+    )
+    assert resp.status_code == 200
+    assert resp.get_json()["album_art"] == "https://api.deezer.com/album/111/image"
+    # Album art is a pure template -> no network call.
+    assert calls == []
+
+
+def test_album_art_deezer_artist_uses_api(client, monkeypatch):
+    app_module.album_art_cache.clear()
+    calls = _stub_http_get(monkeypatch, {"picture_medium": "http://art/medium.jpg"})
+    resp = client.get(
+        "/api/album-art",
+        query_string={"source": "deezer", "type": "artist", "id": "333"},
+    )
+    assert resp.status_code == 200
+    assert resp.get_json()["album_art"] == "http://art/medium.jpg"
+    # Artist art hit the adapter's seam, not the real network.
+    assert calls and calls[0]["url"] == "https://api.deezer.com/artist/333"

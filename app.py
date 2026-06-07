@@ -1237,26 +1237,11 @@ def get_album_art():
             return jsonify({"album_art": ""})
 
         elif source == "deezer":
-            if media_type == "artist":
-                try:
-                    response = requests.get(
-                        f"https://api.deezer.com/artist/{item_id}", timeout=3
-                    )
-                    if response.status_code == 200:
-                        data = response.json()
-                        album_art = data.get("picture_medium", data.get("picture", ""))
-                        if album_art:
-                            album_art_cache[cache_key] = album_art
-                            return jsonify({"album_art": album_art})
-                except:
-                    pass
-                return jsonify({"album_art": ""})
-            else:
-                album_art = f"https://api.deezer.com/{media_type}/{item_id}/image"
-                if album_art:
-                    album_art_cache[cache_key] = album_art
-                    return jsonify({"album_art": album_art})
-                return jsonify({"album_art": ""})
+            result = deezer_source.album_art(item_id, media_type)
+            album_art = result.get("album_art", "")
+            if album_art:
+                album_art_cache[cache_key] = album_art
+            return jsonify({"album_art": album_art})
 
         elif source == "soundcloud":
             # SoundCloud doesn't provide easy access to artwork
@@ -1530,6 +1515,86 @@ class QobuzSource(Source):
 qobuz_source = QobuzSource()
 
 
+class DeezerSource(Source):
+    """Deezer adapter. Deezer needs no credentials. Its art behaviour is
+    asymmetric: album and track art are pure URL templates served by Deezer's
+    image endpoint (no HTTP from us), while **artist** art has no such template
+    and must be read from a real Deezer API call through the ``http_get`` seam.
+    Metadata for album/track URLs also flows through ``http_get``."""
+
+    name = "deezer"
+    api_base = "https://api.deezer.com"
+    _url_patterns = {
+        "album": "https://www.deezer.com/album/{id}",
+        "track": "https://www.deezer.com/track/{id}",
+        "artist": "https://www.deezer.com/artist/{id}",
+        "playlist": "https://www.deezer.com/playlist/{id}",
+    }
+    _id_re = r"/(album|track|playlist|artist)/([0-9]+)"
+
+    def url(self, media_type, item_id):
+        if not item_id:
+            return ""
+        pattern = self._url_patterns.get(media_type)
+        if pattern:
+            return pattern.format(id=item_id)
+        return f"https://www.deezer.com/{media_type}/{item_id}"
+
+    def parse_url(self, url):
+        """Pull (media_type, id) out of a Deezer URL, or (None, None)."""
+        match = re.search(self._id_re, url)
+        if match:
+            return match.group(1), match.group(2)
+        return None, None
+
+    def album_art(self, item_id, media_type):
+        # Album/track art is a pure template against Deezer's image endpoint —
+        # no HTTP from us. Only artist art requires a real API call.
+        if media_type != "artist":
+            return {"album_art": f"{self.api_base}/{media_type}/{item_id}/image"}
+        try:
+            response = http_get(f"{self.api_base}/artist/{item_id}", timeout=3)
+            if response.status_code == 200:
+                data = response.json()
+                album_art = data.get("picture_medium", data.get("picture", ""))
+                if album_art:
+                    return {"album_art": album_art}
+        except Exception as e:
+            logger.error(f"Error fetching Deezer artist art: {e}")
+        return {}
+
+    def metadata(self, url):
+        media_type, item_id = self.parse_url(url)
+        if not item_id:
+            return {}
+
+        result = {}
+        try:
+            if media_type == "album":
+                response = http_get(f"{self.api_base}/album/{item_id}", timeout=5)
+                if response.status_code == 200:
+                    data = response.json()
+                    result["title"] = data.get("title", "")
+                    result["artist"] = data.get("artist", {}).get("name", "")
+                    result["album_art"] = data.get("cover_medium", "")
+
+            elif media_type == "track":
+                response = http_get(f"{self.api_base}/track/{item_id}", timeout=5)
+                if response.status_code == 200:
+                    data = response.json()
+                    result["title"] = data.get("title", "")
+                    result["artist"] = data.get("artist", {}).get("name", "")
+                    album = data.get("album", {})
+                    result["album_art"] = album.get("cover_medium", "")
+        except Exception as e:
+            logger.error(f"Error fetching Deezer metadata: {e}")
+
+        return result
+
+
+deezer_source = DeezerSource()
+
+
 def construct_url(source, media_type, item_id):
     if not item_id:
         return ""
@@ -1538,6 +1603,8 @@ def construct_url(source, media_type, item_id):
     # the rest stay inline until their slice lands.
     if source == "qobuz":
         return qobuz_source.url(media_type, item_id)
+    if source == "deezer":
+        return deezer_source.url(media_type, item_id)
 
     url_patterns = {
         "tidal": {
@@ -1545,12 +1612,6 @@ def construct_url(source, media_type, item_id):
             "track": f"https://tidal.com/browse/track/{item_id}",
             "artist": f"https://tidal.com/browse/artist/{item_id}",
             "playlist": f"https://tidal.com/browse/playlist/{item_id}",
-        },
-        "deezer": {
-            "album": f"https://www.deezer.com/album/{item_id}",
-            "track": f"https://www.deezer.com/track/{item_id}",
-            "artist": f"https://www.deezer.com/artist/{item_id}",
-            "playlist": f"https://www.deezer.com/playlist/{item_id}",
         },
         "soundcloud": {
             "track": f"https://soundcloud.com/{item_id}",
@@ -1604,42 +1665,14 @@ def extract_metadata_from_url(url):
 
         elif "deezer.com" in url:
             metadata["service"] = "deezer"
-            match = re.search(r"/(album|track|playlist|artist)/([0-9]+)", url)
-            if match:
-                metadata["type"] = match.group(1)
-                metadata["id"] = match.group(2)
-                metadata.update(fetch_deezer_metadata(metadata["id"], metadata["type"]))
+            media_type, item_id = deezer_source.parse_url(url)
+            if item_id:
+                metadata["type"] = media_type
+                metadata["id"] = item_id
+                metadata.update(deezer_source.metadata(url))
 
     except Exception as e:
         logger.error(f"Error extracting metadata from URL: {e}")
-
-    return metadata
-
-
-def fetch_deezer_metadata(item_id, item_type):
-    metadata = {}
-    try:
-        api_base = "https://api.deezer.com"
-
-        if item_type == "album":
-            response = requests.get(f"{api_base}/album/{item_id}", timeout=5)
-            if response.status_code == 200:
-                data = response.json()
-                metadata["title"] = data.get("title", "")
-                metadata["artist"] = data.get("artist", {}).get("name", "")
-                metadata["album_art"] = data.get("cover_medium", "")
-
-        elif item_type == "track":
-            response = requests.get(f"{api_base}/track/{item_id}", timeout=5)
-            if response.status_code == 200:
-                data = response.json()
-                metadata["title"] = data.get("title", "")
-                metadata["artist"] = data.get("artist", {}).get("name", "")
-                album = data.get("album", {})
-                metadata["album_art"] = album.get("cover_medium", "")
-
-    except Exception as e:
-        logger.error(f"Error fetching Deezer metadata: {e}")
 
     return metadata
 
