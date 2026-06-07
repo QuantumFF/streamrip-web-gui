@@ -49,16 +49,104 @@ except OSError as e:
     logger.error("=" * 60)
 
 download_queue = queue.Queue()
-# Server is the source of truth (ADR-0002): Active + History live here in memory.
-# active_downloads maps task_id -> Download record (status: queued | downloading).
-active_downloads = {}
-active_lock = threading.Lock()
-download_history = []
-history_lock = threading.Lock()
 sse_clients = []
 album_art_cache = {}
 cache_lock = threading.Lock()
 MAX_HISTORY = 50
+
+
+class DownloadStore:
+    """Owns the server's authoritative in-memory Download state (ADR-0002):
+    the Active set (Queued + Downloading) and the terminal History, plus the
+    locks guarding them. It is the single source of truth for that state — no
+    other code touches the underlying dicts/lists directly.
+
+    The queue.Queue worker-dispatch pipe lives outside the store; the store
+    only models the Active/History lifecycle the queue feeds. The interface is
+    deliberately small (add_queued / mark_downloading / finalize / snapshot /
+    find_history) so a disk-persistence adapter could later replace it without
+    changing callers, exactly as ADR-0002 anticipated. No persistence is added
+    here: in-memory remains the only adapter.
+
+    active maps task_id -> Download record (status: queued | downloading)."""
+
+    def __init__(self, max_history=MAX_HISTORY):
+        self._max_history = max_history
+        self._active = {}
+        self._active_lock = threading.Lock()
+        self._history = []
+        self._history_lock = threading.Lock()
+        self._seq = 0
+
+    def next_id(self):
+        """Allocate a unique Download id under the Active lock, so id assignment
+        never reads Active state without holding it."""
+        with self._active_lock:
+            self._seq += 1
+            return f"dl_{int(time.time() * 1000)}_{self._seq}"
+
+    def add_queued(self, record):
+        """Record a submitted Download in Active as `queued`."""
+        with self._active_lock:
+            self._active[record["id"]] = record
+
+    def mark_downloading(self, task_id, started):
+        """Transition an existing Queued record in place to `downloading`."""
+        with self._active_lock:
+            record = self._active.get(task_id)
+            if record is not None:
+                record["status"] = "downloading"
+                record["started"] = started
+
+    def finalize(self, entry):
+        """Pop the Download from Active and prepend its terminal History entry,
+        trimming History to max_history. The Active record's url/quality/metadata
+        are folded into the entry when the caller did not supply them, because
+        Redownload re-runs a History entry from exactly those fields."""
+        task_id = entry["id"]
+        with self._active_lock:
+            record = self._active.pop(task_id, None)
+        if record is not None:
+            entry.setdefault("url", record.get("url"))
+            entry.setdefault("quality", record.get("quality"))
+            if not entry.get("metadata"):
+                entry["metadata"] = record.get("metadata", {})
+        entry.setdefault("url", None)
+        entry.setdefault("quality", None)
+        entry.setdefault("metadata", {})
+        with self._history_lock:
+            self._history.insert(0, entry)
+            del self._history[self._max_history:]
+        return entry
+
+    def snapshot(self):
+        """Return a point-in-time copy of Active (list), History (list), and the
+        queue size for /api/status rehydration."""
+        with self._active_lock:
+            active = list(self._active.values())
+        with self._history_lock:
+            history = list(self._history)
+        return {
+            "active": active,
+            "history": history,
+            "queue_size": download_queue.qsize(),
+        }
+
+    def find_history(self, entry_id):
+        """Return the History entry with this id, or None."""
+        with self._history_lock:
+            return next((e for e in self._history if e["id"] == entry_id), None)
+
+    def clear(self):
+        """Drop all Active and History state. Used by the test harness to reset
+        between tests; not part of the production lifecycle."""
+        with self._active_lock:
+            self._active.clear()
+        with self._history_lock:
+            self._history.clear()
+
+
+store = DownloadStore()
 
 # The exact line streamrip logs once per track it refuses to re-download because the
 # track is recorded in its own database. Skip detection keys on this line.
@@ -682,8 +770,7 @@ def register_queued(task):
         "status": "queued",
         "queued_at": time.time(),
     }
-    with active_lock:
-        active_downloads[task["id"]] = record
+    store.add_queued(record)
     broadcast_sse(
         {
             "type": "download_queued",
@@ -703,7 +790,7 @@ def enqueue_download(url, quality=3, metadata=None, no_db=False):
     ``no_db`` forces a Redownload: the worker's `rip` invocation gets --no-db so
     streamrip ignores its own database and downloads an already-recorded item
     again (see the Redownload glossary entry)."""
-    task_id = f"dl_{int(time.time() * 1000)}_{len(active_downloads)}"
+    task_id = store.next_id()
     task = {
         "id": task_id,
         "url": url,
@@ -734,11 +821,7 @@ class DownloadWorker(threading.Thread):
             no_db = task.get("no_db", False)
 
             # Transition the existing Queued card in place to Downloading.
-            with active_lock:
-                record = active_downloads.get(task_id)
-                if record is not None:
-                    record["status"] = "downloading"
-                    record["started"] = time.time()
+            store.mark_downloading(task_id, time.time())
 
             broadcast_sse(
                 {
@@ -821,14 +904,9 @@ def finalize_download(task_id, status, metadata, output, error=None):
     The History entry retains the Download's original URL and quality (taken from
     the Active record) alongside its metadata and final status, because the
     Redownload slice re-runs a History entry from exactly those fields."""
-    with active_lock:
-        record = active_downloads.pop(task_id, None)
-
     entry = {
         "id": task_id,
-        "url": record.get("url") if record else None,
-        "quality": record.get("quality") if record else None,
-        "metadata": metadata or (record.get("metadata") if record else {}),
+        "metadata": metadata or {},
         "status": status,
         "output": output,
         "completed_at": time.time(),
@@ -836,9 +914,9 @@ def finalize_download(task_id, status, metadata, output, error=None):
     if error:
         entry["error"] = error
 
-    with history_lock:
-        download_history.insert(0, entry)
-        del download_history[MAX_HISTORY:]
+    # The store pops the Active record, folds its url/quality/metadata into the
+    # entry, and trims History to MAX_HISTORY.
+    entry = store.finalize(entry)
 
     broadcast_sse(
         {
@@ -947,13 +1025,7 @@ def start_download():
 def get_all_status():
     # Server is the source of truth (ADR-0002). Active is returned as a list so the
     # frontend can rehydrate the unified Active list (Queued + Downloading) on load.
-    with active_lock:
-        active = list(active_downloads.values())
-    with history_lock:
-        history = list(download_history)
-    return jsonify(
-        {"active": active, "history": history, "queue_size": download_queue.qsize()}
-    )
+    return jsonify(store.snapshot())
 
 
 @app.route("/api/config", methods=["GET", "POST"])
@@ -1813,8 +1885,7 @@ def redownload():
     if not entry_id:
         return jsonify({"error": "History entry id is required"}), 400
 
-    with history_lock:
-        entry = next((e for e in download_history if e["id"] == entry_id), None)
+    entry = store.find_history(entry_id)
 
     if entry is None:
         return jsonify({"error": "History entry not found"}), 404
