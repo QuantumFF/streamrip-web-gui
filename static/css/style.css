@@ -163,13 +163,23 @@ button:disabled {
     border-bottom-color: var(--accent);
 }
 
+/* Every tab pane is the same fixed height and scrolls its own overflow, so the
+   INFO box stays one size and switching tabs no longer shifts the page. */
 .tab-content {
     display: none;
-    min-height: 400px;
+    height: min(520px, 65vh);
+    overflow-y: auto;
 }
 
 .tab-content.active {
     display: block;
+}
+
+/* Inside a tab the pane already scrolls, so let these inner regions grow to
+   their content instead of opening a second, nested scrollbar. */
+.tabs-section .library-tree {
+    max-height: none;
+    overflow: visible;
 }
 
 .download-item {
@@ -840,6 +850,79 @@ button:disabled {
     color: var(--text-primary);
     margin-top: 4px;
     font-family: 'IBM Plex Mono', monospace;
+}
+
+/* Shrink the results scroll window to a shorter pane (toggled by REDUCE SIZE). */
+.search-results.reduced {
+    max-height: 220px;
+}
+
+.search-results-footer {
+    display: flex;
+    justify-content: center;
+    margin-top: 12px;
+}
+
+.search-results-footer button {
+    font-size: 11px;
+    padding: 8px 16px;
+}
+
+/* Modal confirmation dialog (confirmDialog() in app.js), shared by destructive
+   actions such as deleting an album. */
+.modal-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+    background: rgba(0, 0, 0, 0.7);
+}
+
+.modal-overlay[hidden] {
+    display: none;
+}
+
+.modal {
+    width: 100%;
+    max-width: 440px;
+    padding: 24px;
+    background: var(--bg-secondary, var(--bg-tertiary));
+    border: 1px solid var(--border);
+}
+
+.modal-title {
+    font-size: 14px;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    color: var(--text-primary);
+    margin-bottom: 12px;
+}
+
+.modal-message {
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--text-secondary);
+    margin-bottom: 24px;
+    word-break: break-word;
+}
+
+.modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 12px;
+}
+
+.danger-btn {
+    border-color: var(--error);
+    color: var(--error);
+}
+
+.danger-btn:hover:not(:disabled) {
+    background: var(--error);
+    color: var(--bg-primary);
 }
 /* Scrollbar Styling */
 ::-webkit-scrollbar {

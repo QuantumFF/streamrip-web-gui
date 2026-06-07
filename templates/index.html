@@ -84,6 +84,9 @@
             <div id="searchResults" class="search-results">
                 <div class="empty-state">ENTER A SEARCH QUERY ABOVE</div>
             </div>
+            <div class="search-results-footer">
+                <button id="resizeResults" class="secondary-btn" onclick="toggleResultsHeight(this)">REDUCE SIZE</button>
+            </div>
         </div>
         
         <!-- Tabs Section -->
@@ -129,6 +132,19 @@
     </div>
 
     <div id="toastContainer" class="toast-container" aria-live="polite" aria-atomic="false"></div>
+
+    <!-- Reusable confirmation dialog (see confirmDialog() in app.js). Hidden until
+         a caller opens it; its title/message/buttons are filled in at open time. -->
+    <div id="confirmOverlay" class="modal-overlay" hidden>
+        <div class="modal" role="alertdialog" aria-modal="true" aria-labelledby="confirmTitle" aria-describedby="confirmMessage">
+            <div id="confirmTitle" class="modal-title">CONFIRM</div>
+            <div id="confirmMessage" class="modal-message"></div>
+            <div class="modal-actions">
+                <button id="confirmCancel" class="secondary-btn">CANCEL</button>
+                <button id="confirmOk" class="danger-btn">DELETE</button>
+            </div>
+        </div>
+    </div>
 
     <script src="{{ url_for('static', filename='js/app.js') }}"></script>
 </body>
