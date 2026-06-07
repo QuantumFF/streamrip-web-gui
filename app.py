@@ -529,6 +529,29 @@ def classify_download(returncode, output):
     return "completed"
 
 
+def classify_search_error(returncode, stdout):
+    """Map a finished `rip search` run to a user-facing error message from its
+    exit code and stdout. Pure (mirrors classify_download), so the route's error
+    mapping has locality and a real test surface. Returns None on success."""
+    if returncode == 0:
+        return None
+    error_msg = "Streamrip search failed"
+    if stdout:
+        if "InvalidAppSecretError" in stdout:
+            error_msg = "Invalid Qobuz app secrets. Update your config with valid secrets or run 'rip config --update' in the container."
+        elif "Traceback" in stdout:
+            error_msg = (
+                "Streamrip encountered an error (check logs for full traceback)"
+            )
+        elif "authentication" in stdout.lower():
+            error_msg = (
+                "Authentication failed - check your Qobuz credentials in config"
+            )
+        elif "credentials" in stdout.lower():
+            error_msg = "Invalid credentials - check your Qobuz configuration"
+    return error_msg
+
+
 def _default_runner(cmd):
     """Run `rip` as a subprocess (ADR-0001), yielding stripped stdout lines and
     finally returning the exit code. This is the seam tests replace with a fake
@@ -962,21 +985,7 @@ def search_music():
             logger.error(
                 f"Streamrip command failed with return code {result.returncode}"
             )
-            error_msg = "Streamrip search failed"
-
-            if result.stdout:
-                if "InvalidAppSecretError" in result.stdout:
-                    error_msg = "Invalid Qobuz app secrets. Update your config with valid secrets or run 'rip config --update' in the container."
-                elif "Traceback" in result.stdout:
-                    error_msg = (
-                        "Streamrip encountered an error (check logs for full traceback)"
-                    )
-                elif "authentication" in result.stdout.lower():
-                    error_msg = (
-                        "Authentication failed - check your Qobuz credentials in config"
-                    )
-                elif "credentials" in result.stdout.lower():
-                    error_msg = "Invalid credentials - check your Qobuz configuration"
+            error_msg = classify_search_error(result.returncode, result.stdout)
 
             return jsonify(
                 {
