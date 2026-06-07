@@ -67,3 +67,16 @@ tracks that *are* present, which streamrip writes into every file. An album is:
   **Missing disc**.
 - **Unknown** — completeness cannot be determined, because no present track has
   readable tags to reveal the expected total.
+
+### Source
+A single music service (Qobuz, Tidal, Deezer, SoundCloud, ...) and everything
+that is specific to it: how to build a share URL from an id and read an id back
+out of one (**url** / parse, both directions), how to fetch its **album art**,
+and how to read **metadata** from one of its URLs. A Source owns its
+credentials/keys too (Qobuz, for instance, reads its app_id and auth token from
+the **Streamrip database**'s config). Each Source reaches the network only
+through the injectable `http_get` seam, mirroring the `run_rip` and
+`read_audio_tags` seams, so an adapter can be exercised with canned JSON and no
+real network. Sources are migrated behind this single interface one at a time;
+a not-yet-migrated source keeps its quirks inline (e.g. in `construct_url` and
+`extract_metadata_from_url`) until its slice lands.

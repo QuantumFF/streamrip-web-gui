@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from collections import namedtuple
 
 import requests
 from flask import (
@@ -48,16 +49,104 @@ except OSError as e:
     logger.error("=" * 60)
 
 download_queue = queue.Queue()
-# Server is the source of truth (ADR-0002): Active + History live here in memory.
-# active_downloads maps task_id -> Download record (status: queued | downloading).
-active_downloads = {}
-active_lock = threading.Lock()
-download_history = []
-history_lock = threading.Lock()
 sse_clients = []
 album_art_cache = {}
 cache_lock = threading.Lock()
 MAX_HISTORY = 50
+
+
+class DownloadStore:
+    """Owns the server's authoritative in-memory Download state (ADR-0002):
+    the Active set (Queued + Downloading) and the terminal History, plus the
+    locks guarding them. It is the single source of truth for that state — no
+    other code touches the underlying dicts/lists directly.
+
+    The queue.Queue worker-dispatch pipe lives outside the store; the store
+    only models the Active/History lifecycle the queue feeds. The interface is
+    deliberately small (add_queued / mark_downloading / finalize / snapshot /
+    find_history) so a disk-persistence adapter could later replace it without
+    changing callers, exactly as ADR-0002 anticipated. No persistence is added
+    here: in-memory remains the only adapter.
+
+    active maps task_id -> Download record (status: queued | downloading)."""
+
+    def __init__(self, max_history=MAX_HISTORY):
+        self._max_history = max_history
+        self._active = {}
+        self._active_lock = threading.Lock()
+        self._history = []
+        self._history_lock = threading.Lock()
+        self._seq = 0
+
+    def next_id(self):
+        """Allocate a unique Download id under the Active lock, so id assignment
+        never reads Active state without holding it."""
+        with self._active_lock:
+            self._seq += 1
+            return f"dl_{int(time.time() * 1000)}_{self._seq}"
+
+    def add_queued(self, record):
+        """Record a submitted Download in Active as `queued`."""
+        with self._active_lock:
+            self._active[record["id"]] = record
+
+    def mark_downloading(self, task_id, started):
+        """Transition an existing Queued record in place to `downloading`."""
+        with self._active_lock:
+            record = self._active.get(task_id)
+            if record is not None:
+                record["status"] = "downloading"
+                record["started"] = started
+
+    def finalize(self, entry):
+        """Pop the Download from Active and prepend its terminal History entry,
+        trimming History to max_history. The Active record's url/quality/metadata
+        are folded into the entry when the caller did not supply them, because
+        Redownload re-runs a History entry from exactly those fields."""
+        task_id = entry["id"]
+        with self._active_lock:
+            record = self._active.pop(task_id, None)
+        if record is not None:
+            entry.setdefault("url", record.get("url"))
+            entry.setdefault("quality", record.get("quality"))
+            if not entry.get("metadata"):
+                entry["metadata"] = record.get("metadata", {})
+        entry.setdefault("url", None)
+        entry.setdefault("quality", None)
+        entry.setdefault("metadata", {})
+        with self._history_lock:
+            self._history.insert(0, entry)
+            del self._history[self._max_history:]
+        return entry
+
+    def snapshot(self):
+        """Return a point-in-time copy of Active (list), History (list), and the
+        queue size for /api/status rehydration."""
+        with self._active_lock:
+            active = list(self._active.values())
+        with self._history_lock:
+            history = list(self._history)
+        return {
+            "active": active,
+            "history": history,
+            "queue_size": download_queue.qsize(),
+        }
+
+    def find_history(self, entry_id):
+        """Return the History entry with this id, or None."""
+        with self._history_lock:
+            return next((e for e in self._history if e["id"] == entry_id), None)
+
+    def clear(self):
+        """Drop all Active and History state. Used by the test harness to reset
+        between tests; not part of the production lifecycle."""
+        with self._active_lock:
+            self._active.clear()
+        with self._history_lock:
+            self._history.clear()
+
+
+store = DownloadStore()
 
 # The exact line streamrip logs once per track it refuses to re-download because the
 # track is recorded in its own database. Skip detection keys on this line.
@@ -102,6 +191,18 @@ def _default_tag_reader(filepath):
 # that returns canned tags so the Library suite needs neither mutagen nor real
 # audio files; production reads tags off disk with mutagen.
 read_audio_tags = _default_tag_reader
+
+
+def _default_http_get(url, **kwargs):
+    """Perform an HTTP GET. This is the seam every Source's network access flows
+    through (mirrors run_rip / read_audio_tags); tests swap it for a fake that
+    returns canned JSON so adapters are exercised with no real network."""
+    return requests.get(url, **kwargs)
+
+
+# Injectable HTTP boundary for Source adapters. Tests swap this for a fake whose
+# return value has the real response's .status_code / .json() shape.
+http_get = _default_http_get
 
 
 def _is_audio_file(filename):
@@ -503,6 +604,19 @@ def build_rip_command(
     return cmd
 
 
+def build_search_command(source, search_type, query, output_file, *, config_path=None):
+    """Construct the `rip search` argv. Pure (no side effects) so it can be
+    tested directly. Mirrors build_rip_command's config-path handling: the
+    --config-path flag is only added when the config file exists. This is the
+    single place the search invocation is assembled."""
+    cmd = ["rip"]
+    if config_path and os.path.exists(config_path):
+        cmd.extend(["--config-path", config_path])
+    cmd.extend(["search", "--output-file", output_file])
+    cmd.extend([source, search_type, query])
+    return cmd
+
+
 def classify_download(returncode, output):
     """Map a finished `rip` run to a terminal Download state from its exit code
     and stdout. Pure, so the worker's terminal-state logic is unit-testable."""
@@ -514,6 +628,82 @@ def classify_download(returncode, output):
     if SKIP_LINE_RE.search(output) and "─ Downloading" not in output:
         return "skipped"
     return "completed"
+
+
+def classify_search_error(returncode, stdout):
+    """Map a finished `rip search` run to a user-facing error message from its
+    exit code and stdout. Pure (mirrors classify_download), so the route's error
+    mapping has locality and a real test surface. Returns None on success."""
+    if returncode == 0:
+        return None
+    error_msg = "Streamrip search failed"
+    if stdout:
+        if "InvalidAppSecretError" in stdout:
+            error_msg = "Invalid Qobuz app secrets. Update your config with valid secrets or run 'rip config --update' in the container."
+        elif "Traceback" in stdout:
+            error_msg = (
+                "Streamrip encountered an error (check logs for full traceback)"
+            )
+        elif "authentication" in stdout.lower():
+            error_msg = (
+                "Authentication failed - check your Qobuz credentials in config"
+            )
+        elif "credentials" in stdout.lower():
+            error_msg = "Invalid credentials - check your Qobuz configuration"
+    return error_msg
+
+
+ParsedSearch = namedtuple("ParsedSearch", ["results", "error"])
+
+
+def parse_search_results(content, source, search_type):
+    """Turn the raw text `rip search --output-file` wrote into the result dicts
+    the endpoint serves. Pure (no file IO, no subprocess), so the most
+    correctness-sensitive part of Search — parsing an external program's output —
+    is unit-testable directly rather than only through a live `rip` run.
+
+    Returns a ParsedSearch(results, error):
+      - success      -> (list_of_result_dicts, None)
+      - empty/blank  -> ([], "empty")            # rip wrote nothing
+      - malformed    -> ([], <JSONDecodeError>)  # rip wrote non-JSON
+    Never raises on bad input; the endpoint maps `error` to its response. Owns
+    the `desc` -> title/artist split and the Source URL wiring."""
+    if not content or content.strip() == "":
+        return ParsedSearch([], "empty")
+
+    try:
+        search_data = json.loads(content)
+    except json.JSONDecodeError as e:
+        return ParsedSearch([], e)
+
+    results = []
+    for item in search_data:
+        item_id = item.get("id", "")
+        media_type = item.get("media_type", search_type)
+        url = resolve_source(item.get("source", source)).url(media_type, item_id)
+
+        desc = item.get("desc", "")
+        artist = ""
+        title = desc
+        if " by " in desc:
+            parts = desc.rsplit(" by ", 1)
+            title = parts[0]
+            artist = parts[1]
+
+        results.append(
+            {
+                "id": item_id,
+                "service": item.get("source", source),
+                "type": media_type,
+                "artist": artist if artist else desc,
+                "title": title if artist else "",
+                "desc": desc,
+                "url": url,
+                "album_art": "",
+            }
+        )
+
+    return ParsedSearch(results, None)
 
 
 def _default_runner(cmd):
@@ -546,6 +736,28 @@ def _default_runner(cmd):
 run_rip = _default_runner
 
 
+def _default_search_runner(cmd):
+    """Run `rip search` as a subprocess (ADR-0001), returning the finished
+    CompletedProcess (returncode/stdout/stderr). Search is one-shot — it writes
+    its results to a file and exits — so unlike the streaming download runner
+    this blocks and captures output in one go. This is the seam tests replace
+    with a fake so no test ever launches a real `rip search` process."""
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+
+
+# Injectable subprocess boundary for Search (mirrors run_rip). Tests swap this
+# for a fake returning a result with the same .returncode/.stdout/.stderr shape;
+# production runs the real `rip search`.
+run_search = _default_search_runner
+
+
 def register_queued(task):
     """Register a submitted Download in server Active state as `queued` and
     announce it immediately, before any worker is free. Guarantees a submitted
@@ -558,8 +770,7 @@ def register_queued(task):
         "status": "queued",
         "queued_at": time.time(),
     }
-    with active_lock:
-        active_downloads[task["id"]] = record
+    store.add_queued(record)
     broadcast_sse(
         {
             "type": "download_queued",
@@ -579,7 +790,7 @@ def enqueue_download(url, quality=3, metadata=None, no_db=False):
     ``no_db`` forces a Redownload: the worker's `rip` invocation gets --no-db so
     streamrip ignores its own database and downloads an already-recorded item
     again (see the Redownload glossary entry)."""
-    task_id = f"dl_{int(time.time() * 1000)}_{len(active_downloads)}"
+    task_id = store.next_id()
     task = {
         "id": task_id,
         "url": url,
@@ -610,11 +821,7 @@ class DownloadWorker(threading.Thread):
             no_db = task.get("no_db", False)
 
             # Transition the existing Queued card in place to Downloading.
-            with active_lock:
-                record = active_downloads.get(task_id)
-                if record is not None:
-                    record["status"] = "downloading"
-                    record["started"] = time.time()
+            store.mark_downloading(task_id, time.time())
 
             broadcast_sse(
                 {
@@ -697,14 +904,9 @@ def finalize_download(task_id, status, metadata, output, error=None):
     The History entry retains the Download's original URL and quality (taken from
     the Active record) alongside its metadata and final status, because the
     Redownload slice re-runs a History entry from exactly those fields."""
-    with active_lock:
-        record = active_downloads.pop(task_id, None)
-
     entry = {
         "id": task_id,
-        "url": record.get("url") if record else None,
-        "quality": record.get("quality") if record else None,
-        "metadata": metadata or (record.get("metadata") if record else {}),
+        "metadata": metadata or {},
         "status": status,
         "output": output,
         "completed_at": time.time(),
@@ -712,9 +914,9 @@ def finalize_download(task_id, status, metadata, output, error=None):
     if error:
         entry["error"] = error
 
-    with history_lock:
-        download_history.insert(0, entry)
-        del download_history[MAX_HISTORY:]
+    # The store pops the Active record, folds its url/quality/metadata into the
+    # entry, and trims History to MAX_HISTORY.
+    entry = store.finalize(entry)
 
     broadcast_sse(
         {
@@ -823,13 +1025,7 @@ def start_download():
 def get_all_status():
     # Server is the source of truth (ADR-0002). Active is returned as a list so the
     # frontend can rehydrate the unified Active list (Queued + Downloading) on load.
-    with active_lock:
-        active = list(active_downloads.values())
-    with history_lock:
-        history = list(download_history)
-    return jsonify(
-        {"active": active, "history": history, "queue_size": download_queue.qsize()}
-    )
+    return jsonify(store.snapshot())
 
 
 @app.route("/api/config", methods=["GET", "POST"])
@@ -896,26 +1092,18 @@ def search_music():
 
         logger.info(f"Created temp file: {tmp_path}")
 
-        cmd = ["rip"]
         if os.path.exists(STREAMRIP_CONFIG):
-            cmd.extend(["--config-path", STREAMRIP_CONFIG])
             logger.info(f"Using config file: {STREAMRIP_CONFIG}")
         else:
             logger.warning(f"Config file not found at: {STREAMRIP_CONFIG}")
 
-        cmd.extend(["search", "--output-file", tmp_path])
-        cmd.extend([source, search_type, query])
+        cmd = build_search_command(
+            source, search_type, query, tmp_path, config_path=STREAMRIP_CONFIG
+        )
 
         logger.info(f"Executing command: {' '.join(cmd)}")
 
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=30,
-        )
+        result = run_search(cmd)
 
         logger.info(f"Command completed with return code: {result.returncode}")
 
@@ -935,21 +1123,7 @@ def search_music():
             logger.error(
                 f"Streamrip command failed with return code {result.returncode}"
             )
-            error_msg = "Streamrip search failed"
-
-            if result.stdout:
-                if "InvalidAppSecretError" in result.stdout:
-                    error_msg = "Invalid Qobuz app secrets. Update your config with valid secrets or run 'rip config --update' in the container."
-                elif "Traceback" in result.stdout:
-                    error_msg = (
-                        "Streamrip encountered an error (check logs for full traceback)"
-                    )
-                elif "authentication" in result.stdout.lower():
-                    error_msg = (
-                        "Authentication failed - check your Qobuz credentials in config"
-                    )
-                elif "credentials" in result.stdout.lower():
-                    error_msg = "Invalid credentials - check your Qobuz configuration"
+            error_msg = classify_search_error(result.returncode, result.stdout)
 
             return jsonify(
                 {
@@ -981,7 +1155,9 @@ def search_music():
                 logger.info(f"File content length: {len(content)} characters")
                 logger.debug(f"File content (first 500 chars):\n{content[:500]}")
 
-                if not content or content.strip() == "":
+                parsed = parse_search_results(content, source, search_type)
+
+                if parsed.error == "empty":
                     logger.warning("Temp file is empty!")
                     return jsonify(
                         {
@@ -998,44 +1174,8 @@ def search_music():
                         }
                     )
 
-                try:
-                    search_data = json.loads(content)
-                    logger.info(
-                        f"Successfully parsed JSON with {len(search_data)} items"
-                    )
-
-                    for idx, item in enumerate(search_data):
-                        item_id = item.get("id", "")
-                        media_type = item.get("media_type", search_type)
-                        url = construct_url(
-                            item.get("source", source), media_type, item_id
-                        )
-
-                        desc = item.get("desc", "")
-                        artist = ""
-                        title = desc
-
-                        if " by " in desc:
-                            parts = desc.rsplit(" by ", 1)
-                            title = parts[0]
-                            artist = parts[1]
-
-                        result_item = {
-                            "id": item_id,
-                            "service": item.get("source", source),
-                            "type": media_type,
-                            "artist": artist if artist else desc,
-                            "title": title if artist else "",
-                            "desc": desc,
-                            "url": url,
-                            "album_art": "",
-                        }
-                        results.append(result_item)
-
-                        if idx < 3:  # Log first 3 results
-                            logger.debug(f"Result {idx + 1}: {result_item}")
-
-                except json.JSONDecodeError as e:
+                if isinstance(parsed.error, json.JSONDecodeError):
+                    e = parsed.error
                     logger.error("=" * 60)
                     logger.error("JSON PARSE ERROR")
                     logger.error(f"Error: {e}")
@@ -1072,6 +1212,11 @@ def search_music():
                         ),
                         500,
                     )
+
+                results = parsed.results
+                logger.info(f"Successfully parsed JSON with {len(results)} items")
+                for idx, result_item in enumerate(results[:3]):
+                    logger.debug(f"Result {idx + 1}: {result_item}")
 
         except FileNotFoundError:
             logger.error(f"Temp file not found: {tmp_path}")
@@ -1123,14 +1268,12 @@ def get_album_art():
     if not all([source, media_type, item_id]):
         return jsonify({"error": "Missing parameters"}), 400
 
-    # Todo: handle SoundCloud special case and get correct albums if possible
-    if source == "soundcloud":
-        if "|" in item_id:
-            item_id = item_id.split("|")[0]
-        elif "soundcloud:tracks:" in item_id:
-            match = re.search(r"soundcloud:tracks:(\d+)", item_id)
-            if match:
-                item_id = match.group(1)
+    adapter = resolve_source(source)
+
+    # Sources whose ids arrive mangled (SoundCloud) recover the bare id; the
+    # default is identity. Normalising before the cache key keeps caching keyed
+    # on the real id.
+    item_id = adapter.normalize_id(item_id)
 
     cache_key = f"{source}_{media_type}_{item_id}"
     if cache_key in album_art_cache:
@@ -1140,58 +1283,24 @@ def get_album_art():
         return jsonify({"album_art": cached})
 
     try:
+        result = adapter.album_art(item_id, media_type)
+        album_art = result.get("album_art", "")
+        # Qobuz carries extra fields the frontend reads; preserve its richer
+        # cached shape, while every other source caches the bare art string and
+        # only when non-empty (matching prior per-source behaviour).
         if source == "qobuz":
-            result = fetch_single_album_art(item_id, media_type, None)
             album_art_cache[cache_key] = result
             return jsonify(
                 {
-                    "album_art": result.get("album_art", ""),
+                    "album_art": album_art,
                     "tracks_count": result.get("tracks_count"),
                     "release_type": result.get("release_type"),
                     "year": result.get("year"),
                 }
             )
-
-        elif source == "tidal":
-            if media_type == "artist":
-                album_art = f"https://resources.tidal.com/images/{item_id}/750x750.jpg"
-            else:
-                album_art = f"https://resources.tidal.com/images/{item_id}/320x320.jpg"
-
-            if album_art:
-                album_art_cache[cache_key] = album_art
-                return jsonify({"album_art": album_art})
-            return jsonify({"album_art": ""})
-
-        elif source == "deezer":
-            if media_type == "artist":
-                try:
-                    response = requests.get(
-                        f"https://api.deezer.com/artist/{item_id}", timeout=3
-                    )
-                    if response.status_code == 200:
-                        data = response.json()
-                        album_art = data.get("picture_medium", data.get("picture", ""))
-                        if album_art:
-                            album_art_cache[cache_key] = album_art
-                            return jsonify({"album_art": album_art})
-                except:
-                    pass
-                return jsonify({"album_art": ""})
-            else:
-                album_art = f"https://api.deezer.com/{media_type}/{item_id}/image"
-                if album_art:
-                    album_art_cache[cache_key] = album_art
-                    return jsonify({"album_art": album_art})
-                return jsonify({"album_art": ""})
-
-        elif source == "soundcloud":
-            # SoundCloud doesn't provide easy access to artwork
-            # Just return empty and let the frontend handle placeholders
-            return jsonify({"album_art": ""})
-
-        # Default return for unknown sources
-        return jsonify({"album_art": ""})
+        if album_art:
+            album_art_cache[cache_key] = album_art
+        return jsonify({"album_art": album_art})
 
     except Exception as e:
         logger.error(
@@ -1273,127 +1382,467 @@ def library_album_tracks():
         return jsonify({"error": str(e)}), 500
 
 
-def get_qobuz_credentials():
+@app.route("/api/library/album", methods=["DELETE"])
+def delete_library_album():
+    """Delete one album folder and everything under it from disk.
+
+    The ``path`` query parameter is the album's path relative to DOWNLOAD_DIR, as
+    returned by /api/library; it is confined to DOWNLOAD_DIR (rejecting traversal)
+    so the endpoint can only delete album folders within the Library, never
+    DOWNLOAD_DIR itself nor arbitrary directories on disk."""
+    rel_path = request.args.get("path")
+    if not rel_path:
+        return jsonify({"error": "path is required"}), 400
+
+    # Confine the resolved album folder to DOWNLOAD_DIR (reject traversal) and
+    # refuse to delete DOWNLOAD_DIR itself.
+    base = os.path.realpath(DOWNLOAD_DIR)
+    target = os.path.realpath(os.path.join(base, rel_path))
+    if target == base or not target.startswith(base + os.sep):
+        return jsonify({"error": "invalid path"}), 400
+    if not os.path.isdir(target):
+        return jsonify({"error": "album not found"}), 404
+
     try:
+        shutil.rmtree(target)
+        # Drop any cached completeness assessment for the now-gone folder.
+        with album_cache_lock:
+            album_assessment_cache.pop(target, None)
+        return jsonify({"success": True})
+    except Exception as e:
+        logger.exception(f"Failed to delete album {rel_path}")
+        return jsonify({"error": str(e)}), 500
+
+
+class Source:
+    """A single music source (Qobuz, Tidal, ...), owning everything that source
+    specific: how to build a share URL from an id, how to fetch its album art,
+    and how to read metadata back out of one of its URLs. Adapters reach the
+    network only through the injectable ``http_get`` seam so they are testable
+    with canned JSON. See the *Source* glossary entry in CONTEXT.md.
+
+    Every source is now behind this interface; URL construction and metadata
+    extraction dispatch over the ``SOURCES`` registry (via ``resolve_source``)
+    rather than per-source branching."""
+
+    name = None
+
+    def normalize_id(self, item_id):
+        """Recover the canonical id from whatever form search hands us. The
+        default is identity; sources whose ids arrive mangled (SoundCloud)
+        override this."""
+        return item_id
+
+    def url(self, media_type, item_id):
+        """Build the canonical share URL for ``media_type``/``item_id``."""
+        raise NotImplementedError
+
+    def album_art(self, item_id, media_type):
+        """Fetch album-art (and any cheap extra metadata) for one item. Returns
+        a dict with at least an ``album_art`` key; ``{}`` when unavailable."""
+        raise NotImplementedError
+
+    def metadata(self, url):
+        """Read whatever metadata this source exposes for one of its URLs.
+        Returns a partial dict to merge onto the base metadata shape."""
+        raise NotImplementedError
+
+
+# Single place the Qobuz app_id is read out of the streamrip config. Both the
+# bare app_id and the full credentials reads share this regex (collapsing the
+# duplicate that used to live in get_qobuz_credentials and get_qobuz_app_id).
+_QOBUZ_APP_ID_RE = r'app_id\s*=\s*["\']?([^"\'\n]+)["\']?'
+_QOBUZ_FALLBACK_APP_ID = "950096963"
+
+
+class QobuzSource(Source):
+    """Qobuz adapter — the richest source: it needs credentials and hits the
+    real Qobuz API for both art and metadata. Owns Qobuz URL construction (both
+    directions), art, metadata, and credential/app_id reading from the streamrip
+    config. All network access goes through the module-level ``http_get`` seam."""
+
+    name = "qobuz"
+    domain = "qobuz.com"
+    api_base = "https://www.qobuz.com/api.json/0.2"
+    _url_patterns = {
+        "album": "https://open.qobuz.com/album/{id}",
+        "track": "https://open.qobuz.com/track/{id}",
+        "artist": "https://open.qobuz.com/artist/{id}",
+        "playlist": "https://open.qobuz.com/playlist/{id}",
+    }
+    _id_re = r"/(album|track|playlist|artist)/([0-9]+)"
+
+    def _read_config(self):
         if os.path.exists(STREAMRIP_CONFIG):
             with open(STREAMRIP_CONFIG, "r") as f:
-                config_content = f.read()
-
-            app_id = re.search(r'app_id\s*=\s*["\']?([^"\'\n]+)["\']?', config_content)
-            token = re.search(r'password_or_token\s*=\s*"([^"]+)"', config_content)
-
-            return {
-                "app_id": app_id.group(1).strip() if app_id else "950096963",
-                "token": token.group(1).strip() if token else None,
-            }
-    except Exception as e:
-        logger.error(f"Error reading Qobuz credentials: {e}")
-    return {"app_id": "950096963", "token": None}
-
-
-def fetch_single_album_art(item_id, media_type, app_id):
-    creds = get_qobuz_credentials()
-    if not creds["token"]:
-        return {}
-
-    try:
-        response = requests.get(
-            f"https://www.qobuz.com/api.json/0.2/{media_type}/get",
-            params={
-                "app_id": creds["app_id"],
-                f"{media_type}_id": item_id,
-            },
-            headers={
-                "X-App-Id": creds["app_id"],
-                "X-User-Auth-Token": creds["token"],
-            },
-            timeout=3,
-        )
-        if response.status_code == 200:
-            data = response.json()
-            image = data.get("image", {})
-
-            year = None
-            release_date = data.get("release_date_original", "")
-            if release_date:
-                year = release_date[:4]
-
-            return {
-                "album_art": image.get("large")
-                or image.get("small")
-                or image.get("thumbnail")
-                or "",
-                "tracks_count": data.get("tracks_count"),
-                "release_type": data.get("release_type"),
-                "year": year,
-            }
-    except Exception as e:
-        logger.error(f"Error fetching Qobuz album art: {e}")
-    return {}
-
-
-def get_qobuz_app_id():
-    try:
-        if os.path.exists(STREAMRIP_CONFIG):
-            with open(STREAMRIP_CONFIG, "r") as f:
-                config_content = f.read()
-                # logger.debug(f"Config file content: {config_content[:200]}...")  # First 200 chars
-
-            app_id_match = re.search(
-                r'app_id\s*=\s*["\']?([^"\'\n]+)["\']?', config_content
-            )
-
-            if app_id_match:
-                app_id = app_id_match.group(1).strip()
-                logger.debug(f"Found app_id in config: {app_id}")
-                return app_id
-            else:
-                logger.debug("No app_id found in config, using fallback")
-
-        # Return a known working app_id as fallback
-        fallback_app_id = "950096963"
-        logger.debug(f"Using fallback app_id: {fallback_app_id}")
-        return fallback_app_id
-
-    except Exception as e:
-        logger.error(f"Error extracting app_id: {e}")
-        return "950096963"
-
-
-def construct_url(source, media_type, item_id):
-    if not item_id:
+                return f.read()
         return ""
 
-    url_patterns = {
-        "qobuz": {
-            "album": f"https://open.qobuz.com/album/{item_id}",
-            "track": f"https://open.qobuz.com/track/{item_id}",
-            "artist": f"https://open.qobuz.com/artist/{item_id}",
-            "playlist": f"https://open.qobuz.com/playlist/{item_id}",
-        },
-        "tidal": {
-            "album": f"https://tidal.com/browse/album/{item_id}",
-            "track": f"https://tidal.com/browse/track/{item_id}",
-            "artist": f"https://tidal.com/browse/artist/{item_id}",
-            "playlist": f"https://tidal.com/browse/playlist/{item_id}",
-        },
-        "deezer": {
-            "album": f"https://www.deezer.com/album/{item_id}",
-            "track": f"https://www.deezer.com/track/{item_id}",
-            "artist": f"https://www.deezer.com/artist/{item_id}",
-            "playlist": f"https://www.deezer.com/playlist/{item_id}",
-        },
-        "soundcloud": {
-            "track": f"https://soundcloud.com/{item_id}",
-            "album": f"https://soundcloud.com/{item_id}",
-            "playlist": f"https://soundcloud.com/{item_id}",
-        },
+    def credentials(self):
+        """Read the Qobuz app_id and auth token from the streamrip config,
+        falling back to a known-working app_id and no token."""
+        try:
+            config_content = self._read_config()
+            if config_content:
+                app_id = re.search(_QOBUZ_APP_ID_RE, config_content)
+                token = re.search(
+                    r'password_or_token\s*=\s*"([^"]+)"', config_content
+                )
+                return {
+                    "app_id": app_id.group(1).strip()
+                    if app_id
+                    else _QOBUZ_FALLBACK_APP_ID,
+                    "token": token.group(1).strip() if token else None,
+                }
+        except Exception as e:
+            logger.error(f"Error reading Qobuz credentials: {e}")
+        return {"app_id": _QOBUZ_FALLBACK_APP_ID, "token": None}
+
+    def app_id(self):
+        """The Qobuz app_id alone (metadata calls need no token)."""
+        return self.credentials()["app_id"]
+
+    def url(self, media_type, item_id):
+        if not item_id:
+            return ""
+        pattern = self._url_patterns.get(media_type)
+        if pattern:
+            return pattern.format(id=item_id)
+        return f"https://open.qobuz.com/{media_type}/{item_id}"
+
+    def parse_url(self, url):
+        """Pull (media_type, id) out of a Qobuz URL, or (None, None)."""
+        match = re.search(self._id_re, url)
+        if match:
+            return match.group(1), match.group(2)
+        return None, None
+
+    def album_art(self, item_id, media_type):
+        creds = self.credentials()
+        if not creds["token"]:
+            return {}
+        try:
+            response = http_get(
+                f"{self.api_base}/{media_type}/get",
+                params={
+                    "app_id": creds["app_id"],
+                    f"{media_type}_id": item_id,
+                },
+                headers={
+                    "X-App-Id": creds["app_id"],
+                    "X-User-Auth-Token": creds["token"],
+                },
+                timeout=3,
+            )
+            if response.status_code == 200:
+                data = response.json()
+                image = data.get("image", {})
+
+                year = None
+                release_date = data.get("release_date_original", "")
+                if release_date:
+                    year = release_date[:4]
+
+                return {
+                    "album_art": image.get("large")
+                    or image.get("small")
+                    or image.get("thumbnail")
+                    or "",
+                    "tracks_count": data.get("tracks_count"),
+                    "release_type": data.get("release_type"),
+                    "year": year,
+                }
+        except Exception as e:
+            logger.error(f"Error fetching Qobuz album art: {e}")
+        return {}
+
+    def metadata(self, url):
+        media_type, item_id = self.parse_url(url)
+        if not item_id:
+            return {}
+
+        result = {}
+        try:
+            app_id = self.app_id()
+            if media_type == "album":
+                response = http_get(
+                    f"{self.api_base}/album/get",
+                    params={"album_id": item_id, "app_id": app_id},
+                    timeout=5,
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    result["title"] = data.get("title", "")
+                    result["artist"] = data.get("artist", {}).get("name", "")
+                    if "image" in data:
+                        for size in ["small", "medium", "large", "thumbnail"]:
+                            if size in data["image"]:
+                                result["album_art"] = data["image"][size]
+                                break
+
+            elif media_type == "track":
+                response = http_get(
+                    f"{self.api_base}/track/get",
+                    params={"track_id": item_id, "app_id": app_id},
+                    timeout=5,
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    result["title"] = data.get("title", "")
+                    result["artist"] = data.get("performer", {}).get("name", "")
+                    album = data.get("album", {})
+                    if "image" in album:
+                        for size in ["small", "medium", "large", "thumbnail"]:
+                            if size in album["image"]:
+                                result["album_art"] = album["image"][size]
+                                break
+        except Exception as e:
+            logger.error(f"Error fetching Qobuz metadata: {e}")
+
+        return result
+
+
+qobuz_source = QobuzSource()
+
+
+class DeezerSource(Source):
+    """Deezer adapter. Deezer needs no credentials. Its art behaviour is
+    asymmetric: album and track art are pure URL templates served by Deezer's
+    image endpoint (no HTTP from us), while **artist** art has no such template
+    and must be read from a real Deezer API call through the ``http_get`` seam.
+    Metadata for album/track URLs also flows through ``http_get``."""
+
+    name = "deezer"
+    domain = "deezer.com"
+    api_base = "https://api.deezer.com"
+    _url_patterns = {
+        "album": "https://www.deezer.com/album/{id}",
+        "track": "https://www.deezer.com/track/{id}",
+        "artist": "https://www.deezer.com/artist/{id}",
+        "playlist": "https://www.deezer.com/playlist/{id}",
     }
+    _id_re = r"/(album|track|playlist|artist)/([0-9]+)"
 
-    if source in url_patterns and media_type in url_patterns[source]:
-        return url_patterns[source][media_type]
+    def url(self, media_type, item_id):
+        if not item_id:
+            return ""
+        pattern = self._url_patterns.get(media_type)
+        if pattern:
+            return pattern.format(id=item_id)
+        return f"https://www.deezer.com/{media_type}/{item_id}"
 
-    return f"https://open.{source}.com/{media_type}/{item_id}"
+    def parse_url(self, url):
+        """Pull (media_type, id) out of a Deezer URL, or (None, None)."""
+        match = re.search(self._id_re, url)
+        if match:
+            return match.group(1), match.group(2)
+        return None, None
+
+    def album_art(self, item_id, media_type):
+        # Album/track art is a pure template against Deezer's image endpoint —
+        # no HTTP from us. Only artist art requires a real API call.
+        if media_type != "artist":
+            return {"album_art": f"{self.api_base}/{media_type}/{item_id}/image"}
+        try:
+            response = http_get(f"{self.api_base}/artist/{item_id}", timeout=3)
+            if response.status_code == 200:
+                data = response.json()
+                album_art = data.get("picture_medium", data.get("picture", ""))
+                if album_art:
+                    return {"album_art": album_art}
+        except Exception as e:
+            logger.error(f"Error fetching Deezer artist art: {e}")
+        return {}
+
+    def metadata(self, url):
+        media_type, item_id = self.parse_url(url)
+        if not item_id:
+            return {}
+
+        result = {}
+        try:
+            if media_type == "album":
+                response = http_get(f"{self.api_base}/album/{item_id}", timeout=5)
+                if response.status_code == 200:
+                    data = response.json()
+                    result["title"] = data.get("title", "")
+                    result["artist"] = data.get("artist", {}).get("name", "")
+                    result["album_art"] = data.get("cover_medium", "")
+
+            elif media_type == "track":
+                response = http_get(f"{self.api_base}/track/{item_id}", timeout=5)
+                if response.status_code == 200:
+                    data = response.json()
+                    result["title"] = data.get("title", "")
+                    result["artist"] = data.get("artist", {}).get("name", "")
+                    album = data.get("album", {})
+                    result["album_art"] = album.get("cover_medium", "")
+        except Exception as e:
+            logger.error(f"Error fetching Deezer metadata: {e}")
+
+        return result
+
+
+deezer_source = DeezerSource()
+
+
+class TidalSource(Source):
+    """Tidal adapter. Both ``url`` and ``album_art`` are pure URL templates — no
+    HTTP from us — and ``metadata`` only yields the art URL plus the id/type read
+    out of the URL (Tidal exposes no cheap title/artist without an API call)."""
+
+    name = "tidal"
+    domain = "tidal.com"
+    _url_patterns = {
+        "album": "https://tidal.com/browse/album/{id}",
+        "track": "https://tidal.com/browse/track/{id}",
+        "artist": "https://tidal.com/browse/artist/{id}",
+        "playlist": "https://tidal.com/browse/playlist/{id}",
+    }
+    _id_re = r"/(album|track|playlist|artist)/([0-9]+)"
+
+    def url(self, media_type, item_id):
+        if not item_id:
+            return ""
+        pattern = self._url_patterns.get(media_type)
+        if pattern:
+            return pattern.format(id=item_id)
+        return f"https://tidal.com/browse/{media_type}/{item_id}"
+
+    def parse_url(self, url):
+        """Pull (media_type, id) out of a Tidal URL, or (None, None)."""
+        match = re.search(self._id_re, url)
+        if match:
+            return match.group(1), match.group(2)
+        return None, None
+
+    def album_art(self, item_id, media_type):
+        # Pure template against Tidal's image CDN — artist art is larger.
+        size = "750x750" if media_type == "artist" else "320x320"
+        return {
+            "album_art": f"https://resources.tidal.com/images/{item_id}/{size}.jpg"
+        }
+
+    def metadata(self, url):
+        media_type, item_id = self.parse_url(url)
+        if not item_id:
+            return {}
+        return {
+            "album_art": f"https://resources.tidal.com/images/{item_id}/320x320.jpg"
+        }
+
+
+tidal_source = TidalSource()
+
+
+class SoundCloudSource(Source):
+    """SoundCloud adapter. Art is always empty (no easy artwork access) and there
+    is no metadata fetch. SoundCloud ids arrive mangled from search — either as
+    ``id|...`` or as a ``soundcloud:tracks:<n>`` urn — so the adapter owns
+    ``normalize_id`` to recover the bare id. SoundCloud has no album/artist
+    search."""
+
+    name = "soundcloud"
+    _track_urn_re = r"soundcloud:tracks:(\d+)"
+
+    def normalize_id(self, item_id):
+        """Recover the bare SoundCloud id from the mangled forms search emits."""
+        if not item_id:
+            return item_id
+        if "|" in item_id:
+            return item_id.split("|")[0]
+        match = re.search(self._track_urn_re, item_id)
+        if match:
+            return match.group(1)
+        return item_id
+
+    def url(self, media_type, item_id):
+        if not item_id:
+            return ""
+        return f"https://soundcloud.com/{item_id}"
+
+    def album_art(self, item_id, media_type):
+        return {"album_art": ""}
+
+
+soundcloud_source = SoundCloudSource()
+
+
+class SpotifySource(Source):
+    """Spotify adapter. Spotify needs OAuth to read anything, so ``metadata``
+    only records the id/type parsed from the URL and there is no art."""
+
+    name = "spotify"
+    domain = "spotify.com"
+    _id_re = r"/(album|track|playlist|artist)/([a-zA-Z0-9]+)"
+
+    def url(self, media_type, item_id):
+        if not item_id:
+            return ""
+        return f"https://open.spotify.com/{media_type}/{item_id}"
+
+    def parse_url(self, url):
+        """Pull (media_type, id) out of a Spotify URL, or (None, None)."""
+        match = re.search(self._id_re, url)
+        if match:
+            return match.group(1), match.group(2)
+        return None, None
+
+    def album_art(self, item_id, media_type):
+        return {"album_art": ""}
+
+    def metadata(self, url):
+        # OAuth required to fetch — record nothing beyond what the caller parses.
+        return {}
+
+
+spotify_source = SpotifySource()
+
+
+class GenericSource(Source):
+    """Fallback for any source without a dedicated adapter. URL is the generic
+    ``open.<source>.com`` template; no art and no metadata. Lets the registry
+    dispatch over a single interface for every source instead of branching on
+    unknown names."""
+
+    def __init__(self, name):
+        self.name = name
+
+    def url(self, media_type, item_id):
+        if not item_id:
+            return ""
+        return f"https://open.{self.name}.com/{media_type}/{item_id}"
+
+    def album_art(self, item_id, media_type):
+        return {"album_art": ""}
+
+
+# Registry of Source adapters, keyed by name. Dispatch over this replaces the
+# old per-source ``construct_url`` / ``extract_metadata_from_url`` branching;
+# ``resolve_source`` hands back a GenericSource for any unregistered name so the
+# interface is uniform. ``SOURCES_BY_DOMAIN`` resolves a pasted URL back to its
+# source for metadata extraction (only sources that parse a URL belong here —
+# SoundCloud has no metadata fetch).
+SOURCES = {
+    src.name: src
+    for src in (
+        qobuz_source,
+        deezer_source,
+        tidal_source,
+        soundcloud_source,
+        spotify_source,
+    )
+}
+SOURCES_BY_DOMAIN = {
+    src.domain: src
+    for src in SOURCES.values()
+    if getattr(src, "domain", None)
+}
+
+
+def resolve_source(name):
+    """The Source adapter for ``name``, or a GenericSource fallback."""
+    return SOURCES.get(name) or GenericSource(name)
 
 
 def extract_metadata_from_url(url):
@@ -1407,115 +1856,18 @@ def extract_metadata_from_url(url):
     }
 
     try:
-        if "spotify.com" in url:
-            metadata["service"] = "spotify"
-            match = re.search(r"/(album|track|playlist|artist)/([a-zA-Z0-9]+)", url)
-            if match:
-                metadata["type"] = match.group(1)
-                metadata["id"] = match.group(2)
-                # Note: Spotify requires OAuth for metadata, so we can't easily fetch it
-
-        elif "qobuz.com" in url:
-            metadata["service"] = "qobuz"
-            match = re.search(r"/(album|track|playlist|artist)/([0-9]+)", url)
-            if match:
-                metadata["type"] = match.group(1)
-                metadata["id"] = match.group(2)
-                metadata.update(fetch_qobuz_metadata(metadata["id"], metadata["type"]))
-
-        elif "tidal.com" in url:
-            metadata["service"] = "tidal"
-            match = re.search(r"/(album|track|playlist|artist)/([0-9]+)", url)
-            if match:
-                metadata["type"] = match.group(1)
-                metadata["id"] = match.group(2)
-                metadata["album_art"] = (
-                    f"https://resources.tidal.com/images/{metadata['id']}/320x320.jpg"
-                )
-
-        elif "deezer.com" in url:
-            metadata["service"] = "deezer"
-            match = re.search(r"/(album|track|playlist|artist)/([0-9]+)", url)
-            if match:
-                metadata["type"] = match.group(1)
-                metadata["id"] = match.group(2)
-                metadata.update(fetch_deezer_metadata(metadata["id"], metadata["type"]))
-
+        adapter = next(
+            (src for dom, src in SOURCES_BY_DOMAIN.items() if dom in url), None
+        )
+        if adapter:
+            metadata["service"] = adapter.name
+            media_type, item_id = adapter.parse_url(url)
+            if item_id:
+                metadata["type"] = media_type
+                metadata["id"] = item_id
+                metadata.update(adapter.metadata(url))
     except Exception as e:
         logger.error(f"Error extracting metadata from URL: {e}")
-
-    return metadata
-
-
-def fetch_qobuz_metadata(item_id, item_type):
-    metadata = {}
-    try:
-        app_id = get_qobuz_app_id()
-        api_base = "https://www.qobuz.com/api.json/0.2"
-
-        if item_type == "album":
-            response = requests.get(
-                f"{api_base}/album/get",
-                params={"album_id": item_id, "app_id": app_id},
-                timeout=5,
-            )
-            if response.status_code == 200:
-                data = response.json()
-                metadata["title"] = data.get("title", "")
-                metadata["artist"] = data.get("artist", {}).get("name", "")
-                if "image" in data:
-                    for size in ["small", "medium", "large", "thumbnail"]:
-                        if size in data["image"]:
-                            metadata["album_art"] = data["image"][size]
-                            break
-
-        elif item_type == "track":
-            response = requests.get(
-                f"{api_base}/track/get",
-                params={"track_id": item_id, "app_id": app_id},
-                timeout=5,
-            )
-            if response.status_code == 200:
-                data = response.json()
-                metadata["title"] = data.get("title", "")
-                metadata["artist"] = data.get("performer", {}).get("name", "")
-                album = data.get("album", {})
-                if "image" in album:
-                    for size in ["small", "medium", "large", "thumbnail"]:
-                        if size in album["image"]:
-                            metadata["album_art"] = album["image"][size]
-                            break
-
-    except Exception as e:
-        logger.error(f"Error fetching Qobuz metadata: {e}")
-
-    return metadata
-
-
-def fetch_deezer_metadata(item_id, item_type):
-    metadata = {}
-    try:
-        api_base = "https://api.deezer.com"
-
-        if item_type == "album":
-            response = requests.get(f"{api_base}/album/{item_id}", timeout=5)
-            if response.status_code == 200:
-                data = response.json()
-                metadata["title"] = data.get("title", "")
-                metadata["artist"] = data.get("artist", {}).get("name", "")
-                metadata["album_art"] = data.get("cover_medium", "")
-
-        elif item_type == "track":
-            response = requests.get(f"{api_base}/track/{item_id}", timeout=5)
-            if response.status_code == 200:
-                data = response.json()
-                metadata["title"] = data.get("title", "")
-                metadata["artist"] = data.get("artist", {}).get("name", "")
-                album = data.get("album", {})
-                metadata["album_art"] = album.get("cover_medium", "")
-
-    except Exception as e:
-        logger.error(f"Error fetching Deezer metadata: {e}")
 
     return metadata
 
@@ -1565,8 +1917,7 @@ def redownload():
     if not entry_id:
         return jsonify({"error": "History entry id is required"}), 400
 
-    with history_lock:
-        entry = next((e for e in download_history if e["id"] == entry_id), None)
+    entry = store.find_history(entry_id)
 
     if entry is None:
         return jsonify({"error": "History entry not found"}), 404

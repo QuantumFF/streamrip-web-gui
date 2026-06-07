@@ -516,6 +516,7 @@ async function loadLibrary() {
                     <span class="library-album-caret">▸</span>
                     <span class="library-album-name">${escapeHtml(album.album)}</span>
                     <span class="library-album-badge badge-pending" data-role="badge">…</span>
+                    <span class="library-album-delete" onclick="deleteAlbum(this, event)" title="Delete album from disk" role="button">DELETE</span>
                 </button>
                 <div class="library-tracks"></div>
             </div>
@@ -659,6 +660,37 @@ async function toggleAlbum(button) {
     }
 }
 
+// Delete an album folder (and everything under it) from disk. Lives on the
+// album header next to the toggle, so stop the click from also expanding the
+// album, and confirm first — this is an irreversible on-disk delete.
+async function deleteAlbum(el, event) {
+    event.stopPropagation();
+    const albumEl = el.closest('.library-album');
+    const path = albumEl.dataset.path;
+    const confirmed = await confirmDialog({
+        title: 'DELETE ALBUM',
+        message: `Permanently delete "${path}" from disk? This removes the folder and all its files and cannot be undone.`,
+        confirmLabel: 'DELETE',
+        cancelLabel: 'CANCEL',
+    });
+    if (!confirmed) {
+        return;
+    }
+    try {
+        const response = await fetch('/api/library/album?path=' + encodeURIComponent(path), {
+            method: 'DELETE',
+        });
+        const data = await response.json();
+        if (!response.ok) {
+            throw new Error(data.error || 'Failed to delete album');
+        }
+        showToast('Album deleted', 'success');
+        albumEl.remove();
+    } catch (error) {
+        showToast('Failed to delete album: ' + error.message, 'error');
+    }
+}
+
 function setSearchType(type, element) {
     currentSearchType = type;
     document.querySelectorAll('.search-type-btn').forEach(btn => btn.classList.remove('active'));
@@ -799,6 +831,63 @@ function updatePaginationControls() {
     
     document.getElementById('prevPage').disabled = currentPage <= 1;
     document.getElementById('nextPage').disabled = currentPage >= totalPages;
+}
+
+// Toggle a denser layout for the results list: smaller rows with the album art
+// and ID line dropped, so more results fit on screen at once. Purely a view
+// switch — it adds/removes a class and doesn't touch the result data.
+function toggleCompactResults(button) {
+    const resultsDiv = document.getElementById('searchResults');
+    const compact = resultsDiv.classList.toggle('compact');
+    button.classList.toggle('active', compact);
+}
+
+// Shrink the results pane to a shorter scroll window (and back). Just toggles a
+// class that lowers the container's max-height; the result list is untouched.
+function toggleResultsHeight(button) {
+    const resultsDiv = document.getElementById('searchResults');
+    const reduced = resultsDiv.classList.toggle('reduced');
+    button.textContent = reduced ? 'EXPAND SIZE' : 'REDUCE SIZE';
+}
+
+// A custom confirmation dialog standing in for window.confirm: returns a Promise
+// that resolves true if the user confirms, false if they cancel (button, Escape,
+// or clicking the backdrop). Only one dialog is open at a time.
+function confirmDialog({ title = 'CONFIRM', message = '', confirmLabel = 'OK', cancelLabel = 'CANCEL' } = {}) {
+    const overlay = document.getElementById('confirmOverlay');
+    const okBtn = document.getElementById('confirmOk');
+    const cancelBtn = document.getElementById('confirmCancel');
+
+    document.getElementById('confirmTitle').textContent = title;
+    document.getElementById('confirmMessage').textContent = message;
+    okBtn.textContent = confirmLabel;
+    cancelBtn.textContent = cancelLabel;
+
+    return new Promise(resolve => {
+        const close = result => {
+            overlay.hidden = true;
+            okBtn.removeEventListener('click', onOk);
+            cancelBtn.removeEventListener('click', onCancel);
+            overlay.removeEventListener('click', onBackdrop);
+            document.removeEventListener('keydown', onKey);
+            resolve(result);
+        };
+        const onOk = () => close(true);
+        const onCancel = () => close(false);
+        const onBackdrop = e => { if (e.target === overlay) close(false); };
+        const onKey = e => {
+            if (e.key === 'Escape') close(false);
+            else if (e.key === 'Enter') close(true);
+        };
+
+        okBtn.addEventListener('click', onOk);
+        cancelBtn.addEventListener('click', onCancel);
+        overlay.addEventListener('click', onBackdrop);
+        document.addEventListener('keydown', onKey);
+
+        overlay.hidden = false;
+        okBtn.focus();
+    });
 }
 
 function changePage(direction) {

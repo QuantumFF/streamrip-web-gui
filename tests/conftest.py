@@ -23,10 +23,7 @@ def clean_state():
     """Reset server-owned Active/History/queue and restore the real runner
     around every test so tests do not bleed into each other."""
     original_runner = app_module.run_rip
-    with app_module.active_lock:
-        app_module.active_downloads.clear()
-    with app_module.history_lock:
-        app_module.download_history.clear()
+    app_module.store.clear()
     # Drain any leftover queued tasks.
     try:
         while True:
@@ -47,10 +44,7 @@ def clean_state():
     # Let workers settle so they are idle before the next test reconfigures things.
     time.sleep(0.05)
     app_module.run_rip = original_runner
-    with app_module.active_lock:
-        app_module.active_downloads.clear()
-    with app_module.history_lock:
-        app_module.download_history.clear()
+    app_module.store.clear()
 
 
 def fake_runner(lines, returncode=0):

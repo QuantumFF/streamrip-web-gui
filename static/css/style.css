@@ -163,13 +163,23 @@ button:disabled {
     border-bottom-color: var(--accent);
 }
 
+/* Every tab pane is the same fixed height and scrolls its own overflow, so the
+   INFO box stays one size and switching tabs no longer shifts the page. */
 .tab-content {
     display: none;
-    min-height: 400px;
+    height: min(520px, 65vh);
+    overflow-y: auto;
 }
 
 .tab-content.active {
     display: block;
+}
+
+/* Inside a tab the pane already scrolls, so let these inner regions grow to
+   their content instead of opening a second, nested scrollbar. */
+.tabs-section .library-tree {
+    max-height: none;
+    overflow: visible;
 }
 
 .download-item {
@@ -568,6 +578,27 @@ button:disabled {
     border-color: var(--text-tertiary);
 }
 
+/* Per-album delete control, sat in the album header. Muted until hovered so it
+   stays out of the way of the (read-mostly) Library, then turns destructive-red. */
+.library-album-delete {
+    flex-shrink: 0;
+    font-size: 10px;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    padding: 2px 8px;
+    border: 1px solid var(--border);
+    border-radius: 2px;
+    color: var(--text-tertiary);
+    white-space: nowrap;
+    cursor: pointer;
+    transition: color 0.2s, border-color 0.2s;
+}
+
+.library-album-delete:hover {
+    color: var(--error);
+    border-color: var(--error);
+}
+
 .library-tracks {
     display: none;
     padding-left: 20px;
@@ -684,10 +715,49 @@ button:disabled {
 }
 
 .results-info {
+    display: flex;
+    align-items: center;
+    gap: 12px;
     font-size: 12px;
     color: var(--text-secondary);
     text-transform: uppercase;
     letter-spacing: 0.5px;
+}
+
+/* Toggle for the dense results layout. Muted until active, then highlighted so
+   it reads as an on/off switch. */
+.compact-toggle {
+    padding: 6px 12px;
+    font-size: 11px;
+    color: var(--text-tertiary);
+    border: 1px solid var(--border);
+    background: transparent;
+}
+
+.compact-toggle.active {
+    color: var(--accent, var(--text-primary));
+    border-color: var(--text-primary);
+}
+
+/* Compact results: tighter rows, no album art or ID line, so more fit at once. */
+.search-results.compact .search-result-item {
+    padding: 8px 12px;
+    margin-bottom: 4px;
+    gap: 12px;
+}
+
+.search-results.compact .result-album-art,
+.search-results.compact .result-id,
+.search-results.compact .result-service {
+    display: none;
+}
+
+.search-results.compact .result-title {
+    margin-bottom: 2px;
+}
+
+.search-results.compact .result-download-btn {
+    padding: 6px 14px;
 }
 
 .search-results {
@@ -780,6 +850,79 @@ button:disabled {
     color: var(--text-primary);
     margin-top: 4px;
     font-family: 'IBM Plex Mono', monospace;
+}
+
+/* Shrink the results scroll window to a shorter pane (toggled by REDUCE SIZE). */
+.search-results.reduced {
+    max-height: 220px;
+}
+
+.search-results-footer {
+    display: flex;
+    justify-content: center;
+    margin-top: 12px;
+}
+
+.search-results-footer button {
+    font-size: 11px;
+    padding: 8px 16px;
+}
+
+/* Modal confirmation dialog (confirmDialog() in app.js), shared by destructive
+   actions such as deleting an album. */
+.modal-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+    background: rgba(0, 0, 0, 0.7);
+}
+
+.modal-overlay[hidden] {
+    display: none;
+}
+
+.modal {
+    width: 100%;
+    max-width: 440px;
+    padding: 24px;
+    background: var(--bg-secondary, var(--bg-tertiary));
+    border: 1px solid var(--border);
+}
+
+.modal-title {
+    font-size: 14px;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    color: var(--text-primary);
+    margin-bottom: 12px;
+}
+
+.modal-message {
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--text-secondary);
+    margin-bottom: 24px;
+    word-break: break-word;
+}
+
+.modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 12px;
+}
+
+.danger-btn {
+    border-color: var(--error);
+    color: var(--error);
+}
+
+.danger-btn:hover:not(:disabled) {
+    background: var(--error);
+    color: var(--bg-primary);
 }
 /* Scrollbar Styling */
 ::-webkit-scrollbar {
