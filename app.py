@@ -105,6 +105,18 @@ def _default_tag_reader(filepath):
 read_audio_tags = _default_tag_reader
 
 
+def _default_http_get(url, **kwargs):
+    """Perform an HTTP GET. This is the seam every Source's network access flows
+    through (mirrors run_rip / read_audio_tags); tests swap it for a fake that
+    returns canned JSON so adapters are exercised with no real network."""
+    return requests.get(url, **kwargs)
+
+
+# Injectable HTTP boundary for Source adapters. Tests swap this for a fake whose
+# return value has the real response's .status_code / .json() shape.
+http_get = _default_http_get
+
+
 def _is_audio_file(filename):
     return filename.lower().endswith(AUDIO_EXTENSIONS)
 
@@ -1202,7 +1214,7 @@ def get_album_art():
 
     try:
         if source == "qobuz":
-            result = fetch_single_album_art(item_id, media_type, None)
+            result = qobuz_source.album_art(item_id, media_type)
             album_art_cache[cache_key] = result
             return jsonify(
                 {
@@ -1334,104 +1346,200 @@ def library_album_tracks():
         return jsonify({"error": str(e)}), 500
 
 
-def get_qobuz_credentials():
-    try:
+class Source:
+    """A single music source (Qobuz, Tidal, ...), owning everything that source
+    specific: how to build a share URL from an id, how to fetch its album art,
+    and how to read metadata back out of one of its URLs. Adapters reach the
+    network only through the injectable ``http_get`` seam so they are testable
+    with canned JSON. See the *Source* glossary entry in CONTEXT.md.
+
+    The Source refactor migrates sources behind this interface one at a time;
+    until a source is migrated its quirks stay inline (e.g. in ``construct_url``
+    and ``extract_metadata_from_url``)."""
+
+    name = None
+
+    def url(self, media_type, item_id):
+        """Build the canonical share URL for ``media_type``/``item_id``."""
+        raise NotImplementedError
+
+    def album_art(self, item_id, media_type):
+        """Fetch album-art (and any cheap extra metadata) for one item. Returns
+        a dict with at least an ``album_art`` key; ``{}`` when unavailable."""
+        raise NotImplementedError
+
+    def metadata(self, url):
+        """Read whatever metadata this source exposes for one of its URLs.
+        Returns a partial dict to merge onto the base metadata shape."""
+        raise NotImplementedError
+
+
+# Single place the Qobuz app_id is read out of the streamrip config. Both the
+# bare app_id and the full credentials reads share this regex (collapsing the
+# duplicate that used to live in get_qobuz_credentials and get_qobuz_app_id).
+_QOBUZ_APP_ID_RE = r'app_id\s*=\s*["\']?([^"\'\n]+)["\']?'
+_QOBUZ_FALLBACK_APP_ID = "950096963"
+
+
+class QobuzSource(Source):
+    """Qobuz adapter — the richest source: it needs credentials and hits the
+    real Qobuz API for both art and metadata. Owns Qobuz URL construction (both
+    directions), art, metadata, and credential/app_id reading from the streamrip
+    config. All network access goes through the module-level ``http_get`` seam."""
+
+    name = "qobuz"
+    api_base = "https://www.qobuz.com/api.json/0.2"
+    _url_patterns = {
+        "album": "https://open.qobuz.com/album/{id}",
+        "track": "https://open.qobuz.com/track/{id}",
+        "artist": "https://open.qobuz.com/artist/{id}",
+        "playlist": "https://open.qobuz.com/playlist/{id}",
+    }
+    _id_re = r"/(album|track|playlist|artist)/([0-9]+)"
+
+    def _read_config(self):
         if os.path.exists(STREAMRIP_CONFIG):
             with open(STREAMRIP_CONFIG, "r") as f:
-                config_content = f.read()
+                return f.read()
+        return ""
 
-            app_id = re.search(r'app_id\s*=\s*["\']?([^"\'\n]+)["\']?', config_content)
-            token = re.search(r'password_or_token\s*=\s*"([^"]+)"', config_content)
+    def credentials(self):
+        """Read the Qobuz app_id and auth token from the streamrip config,
+        falling back to a known-working app_id and no token."""
+        try:
+            config_content = self._read_config()
+            if config_content:
+                app_id = re.search(_QOBUZ_APP_ID_RE, config_content)
+                token = re.search(
+                    r'password_or_token\s*=\s*"([^"]+)"', config_content
+                )
+                return {
+                    "app_id": app_id.group(1).strip()
+                    if app_id
+                    else _QOBUZ_FALLBACK_APP_ID,
+                    "token": token.group(1).strip() if token else None,
+                }
+        except Exception as e:
+            logger.error(f"Error reading Qobuz credentials: {e}")
+        return {"app_id": _QOBUZ_FALLBACK_APP_ID, "token": None}
 
-            return {
-                "app_id": app_id.group(1).strip() if app_id else "950096963",
-                "token": token.group(1).strip() if token else None,
-            }
-    except Exception as e:
-        logger.error(f"Error reading Qobuz credentials: {e}")
-    return {"app_id": "950096963", "token": None}
+    def app_id(self):
+        """The Qobuz app_id alone (metadata calls need no token)."""
+        return self.credentials()["app_id"]
 
+    def url(self, media_type, item_id):
+        if not item_id:
+            return ""
+        pattern = self._url_patterns.get(media_type)
+        if pattern:
+            return pattern.format(id=item_id)
+        return f"https://open.qobuz.com/{media_type}/{item_id}"
 
-def fetch_single_album_art(item_id, media_type, app_id):
-    creds = get_qobuz_credentials()
-    if not creds["token"]:
+    def parse_url(self, url):
+        """Pull (media_type, id) out of a Qobuz URL, or (None, None)."""
+        match = re.search(self._id_re, url)
+        if match:
+            return match.group(1), match.group(2)
+        return None, None
+
+    def album_art(self, item_id, media_type):
+        creds = self.credentials()
+        if not creds["token"]:
+            return {}
+        try:
+            response = http_get(
+                f"{self.api_base}/{media_type}/get",
+                params={
+                    "app_id": creds["app_id"],
+                    f"{media_type}_id": item_id,
+                },
+                headers={
+                    "X-App-Id": creds["app_id"],
+                    "X-User-Auth-Token": creds["token"],
+                },
+                timeout=3,
+            )
+            if response.status_code == 200:
+                data = response.json()
+                image = data.get("image", {})
+
+                year = None
+                release_date = data.get("release_date_original", "")
+                if release_date:
+                    year = release_date[:4]
+
+                return {
+                    "album_art": image.get("large")
+                    or image.get("small")
+                    or image.get("thumbnail")
+                    or "",
+                    "tracks_count": data.get("tracks_count"),
+                    "release_type": data.get("release_type"),
+                    "year": year,
+                }
+        except Exception as e:
+            logger.error(f"Error fetching Qobuz album art: {e}")
         return {}
 
-    try:
-        response = requests.get(
-            f"https://www.qobuz.com/api.json/0.2/{media_type}/get",
-            params={
-                "app_id": creds["app_id"],
-                f"{media_type}_id": item_id,
-            },
-            headers={
-                "X-App-Id": creds["app_id"],
-                "X-User-Auth-Token": creds["token"],
-            },
-            timeout=3,
-        )
-        if response.status_code == 200:
-            data = response.json()
-            image = data.get("image", {})
+    def metadata(self, url):
+        media_type, item_id = self.parse_url(url)
+        if not item_id:
+            return {}
 
-            year = None
-            release_date = data.get("release_date_original", "")
-            if release_date:
-                year = release_date[:4]
+        result = {}
+        try:
+            app_id = self.app_id()
+            if media_type == "album":
+                response = http_get(
+                    f"{self.api_base}/album/get",
+                    params={"album_id": item_id, "app_id": app_id},
+                    timeout=5,
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    result["title"] = data.get("title", "")
+                    result["artist"] = data.get("artist", {}).get("name", "")
+                    if "image" in data:
+                        for size in ["small", "medium", "large", "thumbnail"]:
+                            if size in data["image"]:
+                                result["album_art"] = data["image"][size]
+                                break
 
-            return {
-                "album_art": image.get("large")
-                or image.get("small")
-                or image.get("thumbnail")
-                or "",
-                "tracks_count": data.get("tracks_count"),
-                "release_type": data.get("release_type"),
-                "year": year,
-            }
-    except Exception as e:
-        logger.error(f"Error fetching Qobuz album art: {e}")
-    return {}
+            elif media_type == "track":
+                response = http_get(
+                    f"{self.api_base}/track/get",
+                    params={"track_id": item_id, "app_id": app_id},
+                    timeout=5,
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    result["title"] = data.get("title", "")
+                    result["artist"] = data.get("performer", {}).get("name", "")
+                    album = data.get("album", {})
+                    if "image" in album:
+                        for size in ["small", "medium", "large", "thumbnail"]:
+                            if size in album["image"]:
+                                result["album_art"] = album["image"][size]
+                                break
+        except Exception as e:
+            logger.error(f"Error fetching Qobuz metadata: {e}")
+
+        return result
 
 
-def get_qobuz_app_id():
-    try:
-        if os.path.exists(STREAMRIP_CONFIG):
-            with open(STREAMRIP_CONFIG, "r") as f:
-                config_content = f.read()
-                # logger.debug(f"Config file content: {config_content[:200]}...")  # First 200 chars
-
-            app_id_match = re.search(
-                r'app_id\s*=\s*["\']?([^"\'\n]+)["\']?', config_content
-            )
-
-            if app_id_match:
-                app_id = app_id_match.group(1).strip()
-                logger.debug(f"Found app_id in config: {app_id}")
-                return app_id
-            else:
-                logger.debug("No app_id found in config, using fallback")
-
-        # Return a known working app_id as fallback
-        fallback_app_id = "950096963"
-        logger.debug(f"Using fallback app_id: {fallback_app_id}")
-        return fallback_app_id
-
-    except Exception as e:
-        logger.error(f"Error extracting app_id: {e}")
-        return "950096963"
+qobuz_source = QobuzSource()
 
 
 def construct_url(source, media_type, item_id):
     if not item_id:
         return ""
 
+    # Migrated sources own their URL construction behind the Source interface;
+    # the rest stay inline until their slice lands.
+    if source == "qobuz":
+        return qobuz_source.url(media_type, item_id)
+
     url_patterns = {
-        "qobuz": {
-            "album": f"https://open.qobuz.com/album/{item_id}",
-            "track": f"https://open.qobuz.com/track/{item_id}",
-            "artist": f"https://open.qobuz.com/artist/{item_id}",
-            "playlist": f"https://open.qobuz.com/playlist/{item_id}",
-        },
         "tidal": {
             "album": f"https://tidal.com/browse/album/{item_id}",
             "track": f"https://tidal.com/browse/track/{item_id}",
@@ -1478,11 +1586,11 @@ def extract_metadata_from_url(url):
 
         elif "qobuz.com" in url:
             metadata["service"] = "qobuz"
-            match = re.search(r"/(album|track|playlist|artist)/([0-9]+)", url)
-            if match:
-                metadata["type"] = match.group(1)
-                metadata["id"] = match.group(2)
-                metadata.update(fetch_qobuz_metadata(metadata["id"], metadata["type"]))
+            media_type, item_id = qobuz_source.parse_url(url)
+            if item_id:
+                metadata["type"] = media_type
+                metadata["id"] = item_id
+                metadata.update(qobuz_source.metadata(url))
 
         elif "tidal.com" in url:
             metadata["service"] = "tidal"
@@ -1504,51 +1612,6 @@ def extract_metadata_from_url(url):
 
     except Exception as e:
         logger.error(f"Error extracting metadata from URL: {e}")
-
-    return metadata
-
-
-def fetch_qobuz_metadata(item_id, item_type):
-    metadata = {}
-    try:
-        app_id = get_qobuz_app_id()
-        api_base = "https://www.qobuz.com/api.json/0.2"
-
-        if item_type == "album":
-            response = requests.get(
-                f"{api_base}/album/get",
-                params={"album_id": item_id, "app_id": app_id},
-                timeout=5,
-            )
-            if response.status_code == 200:
-                data = response.json()
-                metadata["title"] = data.get("title", "")
-                metadata["artist"] = data.get("artist", {}).get("name", "")
-                if "image" in data:
-                    for size in ["small", "medium", "large", "thumbnail"]:
-                        if size in data["image"]:
-                            metadata["album_art"] = data["image"][size]
-                            break
-
-        elif item_type == "track":
-            response = requests.get(
-                f"{api_base}/track/get",
-                params={"track_id": item_id, "app_id": app_id},
-                timeout=5,
-            )
-            if response.status_code == 200:
-                data = response.json()
-                metadata["title"] = data.get("title", "")
-                metadata["artist"] = data.get("performer", {}).get("name", "")
-                album = data.get("album", {})
-                if "image" in album:
-                    for size in ["small", "medium", "large", "thumbnail"]:
-                        if size in album["image"]:
-                            metadata["album_art"] = album["image"][size]
-                            break
-
-    except Exception as e:
-        logger.error(f"Error fetching Qobuz metadata: {e}")
 
     return metadata
 
