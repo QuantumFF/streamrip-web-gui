@@ -68,7 +68,7 @@ def test_missing_optional_fields_fall_back():
     assert item["service"] == "tidal"
     assert item["type"] == "track"
     assert item["desc"] == ""
-    # Empty id -> construct_url returns "".
+    # Empty id -> Source.url returns "".
     assert item["url"] == ""
     assert item["album_art"] == ""
 

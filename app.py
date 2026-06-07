@@ -579,7 +579,7 @@ def parse_search_results(content, source, search_type):
       - empty/blank  -> ([], "empty")            # rip wrote nothing
       - malformed    -> ([], <JSONDecodeError>)  # rip wrote non-JSON
     Never raises on bad input; the endpoint maps `error` to its response. Owns
-    the `desc` -> title/artist split and the construct_url wiring."""
+    the `desc` -> title/artist split and the Source URL wiring."""
     if not content or content.strip() == "":
         return ParsedSearch([], "empty")
 
@@ -592,7 +592,7 @@ def parse_search_results(content, source, search_type):
     for item in search_data:
         item_id = item.get("id", "")
         media_type = item.get("media_type", search_type)
-        url = construct_url(item.get("source", source), media_type, item_id)
+        url = resolve_source(item.get("source", source)).url(media_type, item_id)
 
         desc = item.get("desc", "")
         artist = ""
@@ -1196,14 +1196,12 @@ def get_album_art():
     if not all([source, media_type, item_id]):
         return jsonify({"error": "Missing parameters"}), 400
 
-    # Todo: handle SoundCloud special case and get correct albums if possible
-    if source == "soundcloud":
-        if "|" in item_id:
-            item_id = item_id.split("|")[0]
-        elif "soundcloud:tracks:" in item_id:
-            match = re.search(r"soundcloud:tracks:(\d+)", item_id)
-            if match:
-                item_id = match.group(1)
+    adapter = resolve_source(source)
+
+    # Sources whose ids arrive mangled (SoundCloud) recover the bare id; the
+    # default is identity. Normalising before the cache key keeps caching keyed
+    # on the real id.
+    item_id = adapter.normalize_id(item_id)
 
     cache_key = f"{source}_{media_type}_{item_id}"
     if cache_key in album_art_cache:
@@ -1213,43 +1211,24 @@ def get_album_art():
         return jsonify({"album_art": cached})
 
     try:
+        result = adapter.album_art(item_id, media_type)
+        album_art = result.get("album_art", "")
+        # Qobuz carries extra fields the frontend reads; preserve its richer
+        # cached shape, while every other source caches the bare art string and
+        # only when non-empty (matching prior per-source behaviour).
         if source == "qobuz":
-            result = qobuz_source.album_art(item_id, media_type)
             album_art_cache[cache_key] = result
             return jsonify(
                 {
-                    "album_art": result.get("album_art", ""),
+                    "album_art": album_art,
                     "tracks_count": result.get("tracks_count"),
                     "release_type": result.get("release_type"),
                     "year": result.get("year"),
                 }
             )
-
-        elif source == "tidal":
-            if media_type == "artist":
-                album_art = f"https://resources.tidal.com/images/{item_id}/750x750.jpg"
-            else:
-                album_art = f"https://resources.tidal.com/images/{item_id}/320x320.jpg"
-
-            if album_art:
-                album_art_cache[cache_key] = album_art
-                return jsonify({"album_art": album_art})
-            return jsonify({"album_art": ""})
-
-        elif source == "deezer":
-            result = deezer_source.album_art(item_id, media_type)
-            album_art = result.get("album_art", "")
-            if album_art:
-                album_art_cache[cache_key] = album_art
-            return jsonify({"album_art": album_art})
-
-        elif source == "soundcloud":
-            # SoundCloud doesn't provide easy access to artwork
-            # Just return empty and let the frontend handle placeholders
-            return jsonify({"album_art": ""})
-
-        # Default return for unknown sources
-        return jsonify({"album_art": ""})
+        if album_art:
+            album_art_cache[cache_key] = album_art
+        return jsonify({"album_art": album_art})
 
     except Exception as e:
         logger.error(
@@ -1338,11 +1317,17 @@ class Source:
     network only through the injectable ``http_get`` seam so they are testable
     with canned JSON. See the *Source* glossary entry in CONTEXT.md.
 
-    The Source refactor migrates sources behind this interface one at a time;
-    until a source is migrated its quirks stay inline (e.g. in ``construct_url``
-    and ``extract_metadata_from_url``)."""
+    Every source is now behind this interface; URL construction and metadata
+    extraction dispatch over the ``SOURCES`` registry (via ``resolve_source``)
+    rather than per-source branching."""
 
     name = None
+
+    def normalize_id(self, item_id):
+        """Recover the canonical id from whatever form search hands us. The
+        default is identity; sources whose ids arrive mangled (SoundCloud)
+        override this."""
+        return item_id
 
     def url(self, media_type, item_id):
         """Build the canonical share URL for ``media_type``/``item_id``."""
@@ -1373,6 +1358,7 @@ class QobuzSource(Source):
     config. All network access goes through the module-level ``http_get`` seam."""
 
     name = "qobuz"
+    domain = "qobuz.com"
     api_base = "https://www.qobuz.com/api.json/0.2"
     _url_patterns = {
         "album": "https://open.qobuz.com/album/{id}",
@@ -1523,6 +1509,7 @@ class DeezerSource(Source):
     Metadata for album/track URLs also flows through ``http_get``."""
 
     name = "deezer"
+    domain = "deezer.com"
     api_base = "https://api.deezer.com"
     _url_patterns = {
         "album": "https://www.deezer.com/album/{id}",
@@ -1595,35 +1582,163 @@ class DeezerSource(Source):
 deezer_source = DeezerSource()
 
 
-def construct_url(source, media_type, item_id):
-    if not item_id:
-        return ""
+class TidalSource(Source):
+    """Tidal adapter. Both ``url`` and ``album_art`` are pure URL templates — no
+    HTTP from us — and ``metadata`` only yields the art URL plus the id/type read
+    out of the URL (Tidal exposes no cheap title/artist without an API call)."""
 
-    # Migrated sources own their URL construction behind the Source interface;
-    # the rest stay inline until their slice lands.
-    if source == "qobuz":
-        return qobuz_source.url(media_type, item_id)
-    if source == "deezer":
-        return deezer_source.url(media_type, item_id)
-
-    url_patterns = {
-        "tidal": {
-            "album": f"https://tidal.com/browse/album/{item_id}",
-            "track": f"https://tidal.com/browse/track/{item_id}",
-            "artist": f"https://tidal.com/browse/artist/{item_id}",
-            "playlist": f"https://tidal.com/browse/playlist/{item_id}",
-        },
-        "soundcloud": {
-            "track": f"https://soundcloud.com/{item_id}",
-            "album": f"https://soundcloud.com/{item_id}",
-            "playlist": f"https://soundcloud.com/{item_id}",
-        },
+    name = "tidal"
+    domain = "tidal.com"
+    _url_patterns = {
+        "album": "https://tidal.com/browse/album/{id}",
+        "track": "https://tidal.com/browse/track/{id}",
+        "artist": "https://tidal.com/browse/artist/{id}",
+        "playlist": "https://tidal.com/browse/playlist/{id}",
     }
+    _id_re = r"/(album|track|playlist|artist)/([0-9]+)"
 
-    if source in url_patterns and media_type in url_patterns[source]:
-        return url_patterns[source][media_type]
+    def url(self, media_type, item_id):
+        if not item_id:
+            return ""
+        pattern = self._url_patterns.get(media_type)
+        if pattern:
+            return pattern.format(id=item_id)
+        return f"https://tidal.com/browse/{media_type}/{item_id}"
 
-    return f"https://open.{source}.com/{media_type}/{item_id}"
+    def parse_url(self, url):
+        """Pull (media_type, id) out of a Tidal URL, or (None, None)."""
+        match = re.search(self._id_re, url)
+        if match:
+            return match.group(1), match.group(2)
+        return None, None
+
+    def album_art(self, item_id, media_type):
+        # Pure template against Tidal's image CDN — artist art is larger.
+        size = "750x750" if media_type == "artist" else "320x320"
+        return {
+            "album_art": f"https://resources.tidal.com/images/{item_id}/{size}.jpg"
+        }
+
+    def metadata(self, url):
+        media_type, item_id = self.parse_url(url)
+        if not item_id:
+            return {}
+        return {
+            "album_art": f"https://resources.tidal.com/images/{item_id}/320x320.jpg"
+        }
+
+
+tidal_source = TidalSource()
+
+
+class SoundCloudSource(Source):
+    """SoundCloud adapter. Art is always empty (no easy artwork access) and there
+    is no metadata fetch. SoundCloud ids arrive mangled from search — either as
+    ``id|...`` or as a ``soundcloud:tracks:<n>`` urn — so the adapter owns
+    ``normalize_id`` to recover the bare id. SoundCloud has no album/artist
+    search."""
+
+    name = "soundcloud"
+    _track_urn_re = r"soundcloud:tracks:(\d+)"
+
+    def normalize_id(self, item_id):
+        """Recover the bare SoundCloud id from the mangled forms search emits."""
+        if not item_id:
+            return item_id
+        if "|" in item_id:
+            return item_id.split("|")[0]
+        match = re.search(self._track_urn_re, item_id)
+        if match:
+            return match.group(1)
+        return item_id
+
+    def url(self, media_type, item_id):
+        if not item_id:
+            return ""
+        return f"https://soundcloud.com/{item_id}"
+
+    def album_art(self, item_id, media_type):
+        return {"album_art": ""}
+
+
+soundcloud_source = SoundCloudSource()
+
+
+class SpotifySource(Source):
+    """Spotify adapter. Spotify needs OAuth to read anything, so ``metadata``
+    only records the id/type parsed from the URL and there is no art."""
+
+    name = "spotify"
+    domain = "spotify.com"
+    _id_re = r"/(album|track|playlist|artist)/([a-zA-Z0-9]+)"
+
+    def url(self, media_type, item_id):
+        if not item_id:
+            return ""
+        return f"https://open.spotify.com/{media_type}/{item_id}"
+
+    def parse_url(self, url):
+        """Pull (media_type, id) out of a Spotify URL, or (None, None)."""
+        match = re.search(self._id_re, url)
+        if match:
+            return match.group(1), match.group(2)
+        return None, None
+
+    def album_art(self, item_id, media_type):
+        return {"album_art": ""}
+
+    def metadata(self, url):
+        # OAuth required to fetch — record nothing beyond what the caller parses.
+        return {}
+
+
+spotify_source = SpotifySource()
+
+
+class GenericSource(Source):
+    """Fallback for any source without a dedicated adapter. URL is the generic
+    ``open.<source>.com`` template; no art and no metadata. Lets the registry
+    dispatch over a single interface for every source instead of branching on
+    unknown names."""
+
+    def __init__(self, name):
+        self.name = name
+
+    def url(self, media_type, item_id):
+        if not item_id:
+            return ""
+        return f"https://open.{self.name}.com/{media_type}/{item_id}"
+
+    def album_art(self, item_id, media_type):
+        return {"album_art": ""}
+
+
+# Registry of Source adapters, keyed by name. Dispatch over this replaces the
+# old per-source ``construct_url`` / ``extract_metadata_from_url`` branching;
+# ``resolve_source`` hands back a GenericSource for any unregistered name so the
+# interface is uniform. ``SOURCES_BY_DOMAIN`` resolves a pasted URL back to its
+# source for metadata extraction (only sources that parse a URL belong here —
+# SoundCloud has no metadata fetch).
+SOURCES = {
+    src.name: src
+    for src in (
+        qobuz_source,
+        deezer_source,
+        tidal_source,
+        soundcloud_source,
+        spotify_source,
+    )
+}
+SOURCES_BY_DOMAIN = {
+    src.domain: src
+    for src in SOURCES.values()
+    if getattr(src, "domain", None)
+}
+
+
+def resolve_source(name):
+    """The Source adapter for ``name``, or a GenericSource fallback."""
+    return SOURCES.get(name) or GenericSource(name)
 
 
 def extract_metadata_from_url(url):
@@ -1637,40 +1752,16 @@ def extract_metadata_from_url(url):
     }
 
     try:
-        if "spotify.com" in url:
-            metadata["service"] = "spotify"
-            match = re.search(r"/(album|track|playlist|artist)/([a-zA-Z0-9]+)", url)
-            if match:
-                metadata["type"] = match.group(1)
-                metadata["id"] = match.group(2)
-                # Note: Spotify requires OAuth for metadata, so we can't easily fetch it
-
-        elif "qobuz.com" in url:
-            metadata["service"] = "qobuz"
-            media_type, item_id = qobuz_source.parse_url(url)
+        adapter = next(
+            (src for dom, src in SOURCES_BY_DOMAIN.items() if dom in url), None
+        )
+        if adapter:
+            metadata["service"] = adapter.name
+            media_type, item_id = adapter.parse_url(url)
             if item_id:
                 metadata["type"] = media_type
                 metadata["id"] = item_id
-                metadata.update(qobuz_source.metadata(url))
-
-        elif "tidal.com" in url:
-            metadata["service"] = "tidal"
-            match = re.search(r"/(album|track|playlist|artist)/([0-9]+)", url)
-            if match:
-                metadata["type"] = match.group(1)
-                metadata["id"] = match.group(2)
-                metadata["album_art"] = (
-                    f"https://resources.tidal.com/images/{metadata['id']}/320x320.jpg"
-                )
-
-        elif "deezer.com" in url:
-            metadata["service"] = "deezer"
-            media_type, item_id = deezer_source.parse_url(url)
-            if item_id:
-                metadata["type"] = media_type
-                metadata["id"] = item_id
-                metadata.update(deezer_source.metadata(url))
-
+                metadata.update(adapter.metadata(url))
     except Exception as e:
         logger.error(f"Error extracting metadata from URL: {e}")
 
