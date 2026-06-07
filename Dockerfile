@@ -15,11 +15,19 @@ RUN groupadd -g 1000 appuser && \
 # Set working directory
 WORKDIR /app
 
-# Install Python dependencies
+# Install Python dependencies. streamrip is installed from the upstream `dev`
+# branch (not the PyPI release, which lags behind): PyPI's latest is 2.1.0
+# while dev/host run 2.2.0+, and the config schema version is tied to the
+# streamrip version — a mismatch makes host and container fight over the shared
+# self-mounted config.toml (each rewrites it to its own schema on every run).
+# Tracking dev keeps the container aligned with the host build.
+# Note: `@dev` is a moving target, so rebuilds are not reproducible; Docker
+# layer caching means this only re-pulls when this layer is invalidated
+# (e.g. `--no-cache` or an earlier-layer change).
 RUN pip install --no-cache-dir \
     flask \
     flask-cors \
-    streamrip \
+    "git+https://github.com/nathom/streamrip.git@dev" \
     gunicorn \
     gevent
 
