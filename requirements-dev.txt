@@ -1,1 +1,4 @@
 pytest==9.0.3
+# Used by tests/test_rip_runner_env.py to reproduce streamrip's RichHandler
+# log wrapping; in production rich arrives transitively with streamrip.
+rich
