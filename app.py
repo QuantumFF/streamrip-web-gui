@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from collections import namedtuple
 
 import requests
 from flask import (
@@ -552,6 +553,59 @@ def classify_search_error(returncode, stdout):
     return error_msg
 
 
+ParsedSearch = namedtuple("ParsedSearch", ["results", "error"])
+
+
+def parse_search_results(content, source, search_type):
+    """Turn the raw text `rip search --output-file` wrote into the result dicts
+    the endpoint serves. Pure (no file IO, no subprocess), so the most
+    correctness-sensitive part of Search — parsing an external program's output —
+    is unit-testable directly rather than only through a live `rip` run.
+
+    Returns a ParsedSearch(results, error):
+      - success      -> (list_of_result_dicts, None)
+      - empty/blank  -> ([], "empty")            # rip wrote nothing
+      - malformed    -> ([], <JSONDecodeError>)  # rip wrote non-JSON
+    Never raises on bad input; the endpoint maps `error` to its response. Owns
+    the `desc` -> title/artist split and the construct_url wiring."""
+    if not content or content.strip() == "":
+        return ParsedSearch([], "empty")
+
+    try:
+        search_data = json.loads(content)
+    except json.JSONDecodeError as e:
+        return ParsedSearch([], e)
+
+    results = []
+    for item in search_data:
+        item_id = item.get("id", "")
+        media_type = item.get("media_type", search_type)
+        url = construct_url(item.get("source", source), media_type, item_id)
+
+        desc = item.get("desc", "")
+        artist = ""
+        title = desc
+        if " by " in desc:
+            parts = desc.rsplit(" by ", 1)
+            title = parts[0]
+            artist = parts[1]
+
+        results.append(
+            {
+                "id": item_id,
+                "service": item.get("source", source),
+                "type": media_type,
+                "artist": artist if artist else desc,
+                "title": title if artist else "",
+                "desc": desc,
+                "url": url,
+                "album_art": "",
+            }
+        )
+
+    return ParsedSearch(results, None)
+
+
 def _default_runner(cmd):
     """Run `rip` as a subprocess (ADR-0001), yielding stripped stdout lines and
     finally returning the exit code. This is the seam tests replace with a fake
@@ -1017,7 +1071,9 @@ def search_music():
                 logger.info(f"File content length: {len(content)} characters")
                 logger.debug(f"File content (first 500 chars):\n{content[:500]}")
 
-                if not content or content.strip() == "":
+                parsed = parse_search_results(content, source, search_type)
+
+                if parsed.error == "empty":
                     logger.warning("Temp file is empty!")
                     return jsonify(
                         {
@@ -1034,44 +1090,8 @@ def search_music():
                         }
                     )
 
-                try:
-                    search_data = json.loads(content)
-                    logger.info(
-                        f"Successfully parsed JSON with {len(search_data)} items"
-                    )
-
-                    for idx, item in enumerate(search_data):
-                        item_id = item.get("id", "")
-                        media_type = item.get("media_type", search_type)
-                        url = construct_url(
-                            item.get("source", source), media_type, item_id
-                        )
-
-                        desc = item.get("desc", "")
-                        artist = ""
-                        title = desc
-
-                        if " by " in desc:
-                            parts = desc.rsplit(" by ", 1)
-                            title = parts[0]
-                            artist = parts[1]
-
-                        result_item = {
-                            "id": item_id,
-                            "service": item.get("source", source),
-                            "type": media_type,
-                            "artist": artist if artist else desc,
-                            "title": title if artist else "",
-                            "desc": desc,
-                            "url": url,
-                            "album_art": "",
-                        }
-                        results.append(result_item)
-
-                        if idx < 3:  # Log first 3 results
-                            logger.debug(f"Result {idx + 1}: {result_item}")
-
-                except json.JSONDecodeError as e:
+                if isinstance(parsed.error, json.JSONDecodeError):
+                    e = parsed.error
                     logger.error("=" * 60)
                     logger.error("JSON PARSE ERROR")
                     logger.error(f"Error: {e}")
@@ -1108,6 +1128,11 @@ def search_music():
                         ),
                         500,
                     )
+
+                results = parsed.results
+                logger.info(f"Successfully parsed JSON with {len(results)} items")
+                for idx, result_item in enumerate(results[:3]):
+                    logger.debug(f"Result {idx + 1}: {result_item}")
 
         except FileNotFoundError:
             logger.error(f"Temp file not found: {tmp_path}")
