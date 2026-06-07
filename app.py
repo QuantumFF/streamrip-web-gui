@@ -503,6 +503,19 @@ def build_rip_command(
     return cmd
 
 
+def build_search_command(source, search_type, query, output_file, *, config_path=None):
+    """Construct the `rip search` argv. Pure (no side effects) so it can be
+    tested directly. Mirrors build_rip_command's config-path handling: the
+    --config-path flag is only added when the config file exists. This is the
+    single place the search invocation is assembled."""
+    cmd = ["rip"]
+    if config_path and os.path.exists(config_path):
+        cmd.extend(["--config-path", config_path])
+    cmd.extend(["search", "--output-file", output_file])
+    cmd.extend([source, search_type, query])
+    return cmd
+
+
 def classify_download(returncode, output):
     """Map a finished `rip` run to a terminal Download state from its exit code
     and stdout. Pure, so the worker's terminal-state logic is unit-testable."""
@@ -918,15 +931,14 @@ def search_music():
 
         logger.info(f"Created temp file: {tmp_path}")
 
-        cmd = ["rip"]
         if os.path.exists(STREAMRIP_CONFIG):
-            cmd.extend(["--config-path", STREAMRIP_CONFIG])
             logger.info(f"Using config file: {STREAMRIP_CONFIG}")
         else:
             logger.warning(f"Config file not found at: {STREAMRIP_CONFIG}")
 
-        cmd.extend(["search", "--output-file", tmp_path])
-        cmd.extend([source, search_type, query])
+        cmd = build_search_command(
+            source, search_type, query, tmp_path, config_path=STREAMRIP_CONFIG
+        )
 
         logger.info(f"Executing command: {' '.join(cmd)}")
 
