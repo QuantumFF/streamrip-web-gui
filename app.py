@@ -546,6 +546,28 @@ def _default_runner(cmd):
 run_rip = _default_runner
 
 
+def _default_search_runner(cmd):
+    """Run `rip search` as a subprocess (ADR-0001), returning the finished
+    CompletedProcess (returncode/stdout/stderr). Search is one-shot — it writes
+    its results to a file and exits — so unlike the streaming download runner
+    this blocks and captures output in one go. This is the seam tests replace
+    with a fake so no test ever launches a real `rip search` process."""
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+
+
+# Injectable subprocess boundary for Search (mirrors run_rip). Tests swap this
+# for a fake returning a result with the same .returncode/.stdout/.stderr shape;
+# production runs the real `rip search`.
+run_search = _default_search_runner
+
+
 def register_queued(task):
     """Register a submitted Download in server Active state as `queued` and
     announce it immediately, before any worker is free. Guarantees a submitted
@@ -908,14 +930,7 @@ def search_music():
 
         logger.info(f"Executing command: {' '.join(cmd)}")
 
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=30,
-        )
+        result = run_search(cmd)
 
         logger.info(f"Command completed with return code: {result.returncode}")
 
